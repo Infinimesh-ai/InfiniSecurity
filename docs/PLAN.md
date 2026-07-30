@@ -1,6 +1,8 @@
 # InfiniSecurity 落地计划
 
-状态:M0(2026-07-29 起草)。本文件是完成的定义,验收标准不是建议。
+状态:M0(2026-07-29 起草;2026-07-30 依用户决策更新:风险自适应策略、
+语言选型定稿、恢复范围扩展到企业镜像与 Windows/Mac 物理盘)。
+本文件是完成的定义,验收标准不是建议。
 
 产品定位:**拦截 + 恢复**双支柱。拦截让破坏性操作到不了磁盘;恢复让到了
 磁盘的破坏可以被完整挽回。两条腿都直接来自 2026-07-29 `rm -rf /` 事故:
@@ -70,7 +72,9 @@ shell 字符串——避免引号/转义绕过;`bash -c "..."` 的内层命令�
 
 ### 2.3 行为层(启发式 + 二审 Agent)
 
-保护目录内的删除/移出/截断 → 挂起,`infsec-reviewd` 组装**证据包**:
+保护目录内的删除/移出/截断 → 挂起 → 先做风险分级(见 2.4:T1 免二审放行、
+T2 单 Agent 二审、T3 强模型/双 Agent 会签)→ 需要二审时,`infsec-reviewd`
+组装**证据包**:
 
 ```json
 {
@@ -93,11 +97,35 @@ shell 字符串——避免引号/转义绕过;`bash -c "..."` 的内层命令�
 
 - `deny` 或解析失败或超时(默认 15s)→ **拒绝**。fail-closed 无例外。
 - `allow` 且 `confidence ≥ 阈值` → 放行,但删除走隔离区。
-- 严格模式(M7):Claude 与 Codex 独立复核,**双 allow 才放行**——
+- 二审延迟(5–15s 同步挂起)已确认可接受(2026-07-30 用户决策)——
+  高危操作值得等;T1 路径不产生延迟,日常操作无感。
+- T3 会签模式:Claude 与 Codex 独立复核,**双 allow 才放行**——
   两个不同模型同时幻觉出同一个错误放行的概率远低于单模型。
 - 二审 Agent 永远不能推翻签名层;它的权力是单向收紧的。
 
-### 2.4 爆发检测(勒索软件防护的直接移植)
+### 2.4 风险自适应策略(备份态感知)
+
+**核心思想(2026-07-30 用户决策):拦截的宽严由"可恢复性"决定。**
+一个远端同步良好的项目,删错了代价是 `git restore`;一个只有本地一份的
+项目,删错了代价是取证恢复。同一条命令在这两种状态下的风险完全不同,
+策略必须感知这一点——这也是两大支柱的连接点:恢复能力越强,拦截越可以放行。
+
+判决前,监督器对每个目标路径做**备份态探测**(本地 git 查询,毫秒级,带缓存):
+所属仓库是否有远端、`ahead` 未推提交数、最后 push 距今时间、目标文件是否
+已被最近提交覆盖(干净且已推送 = 可完整恢复)。
+
+| 等级 | 触发条件 | 策略 |
+|---|---|---|
+| **T0 绝对拦截** | 递归删除目标为 `/`、`$HOME`、保护目录根,或命中签名库 | 签名层硬拒(EPERM),任何等级、任何备份态都不放宽,仅人工带外解锁 |
+| **T1 可信** | 操作目标全部在**当前项目仓库内**,且有远端、未推增量小(默认:ahead ≤ 5 且最后 push < 24h,可配) | 免二审直接放行,但仍走隔离区 + 审计——信任的底气是"错了能恢复",所以恢复通道不减配 |
+| **T2 严格** | 项目内操作,但无远端、或增量大、或目标含未跟踪/未提交内容 | 必须二审,fail-closed;未提交内容被删属于最难恢复的损失(事故里 2242 行就是这种) |
+| **T3 跨界** | 操作触及**当前项目之外**的保护路径(跨目录) | 升级复核:使用更强模型,或直接双 Agent 会签(Claude + Codex 双 allow 才放行);跨目录删除极少是单项目任务的合理组成部分 |
+
+备份态探测本身要防欺骗:`ahead` 数以 `git rev-list` 对本地 remote-tracking
+ref 计算,但 remote-tracking ref 可能过期——T1 判定前用 `git ls-remote`
+异步校验(超时则降级 T2,同样 fail-closed 方向)。
+
+### 2.5 爆发检测(勒索软件防护的直接移植)
 
 事故那天,`rm -rf /` 从开始到删完家目录只用了数十秒。逐次二审对这种场景
 太慢,需要速率维度:
@@ -166,7 +194,66 @@ shell 字符串——避免引号/转义绕过;`bash -c "..."` 的内层命令�
 文件的最后已知内容",作为原始块扫描之外的独立恢复源。会话文件可能含
 token/秘密,重放器输出默认进私密目录(0700/0600),秘密文件永不进普通交付物。
 
-## 4. 组件架构
+### 3.5 恢复对象矩阵(企业镜像 + 物理盘)
+
+2026-07-30 用户决策:恢复不只服务本机 Linux,企业虚拟化镜像与
+Windows/Mac 物理盘都是产品场景。分两层解决——**镜像访问层**把一切变成
+只读块设备,**文件系统层**在块设备上做枚举与恢复;两层正交,组合覆盖矩阵。
+
+**镜像访问层**(本机 qemu 8.2 实测:`qemu-nbd --read-only` 原生支持
+vmdk / qcow2 / vhdx / raw / rbd / dmg / parallels——事故恢复实战用的正是这条路):
+
+| 场景 | 格式 | 访问路径 |
+|---|---|---|
+| VMware Workstation / ESXi 虚拟盘 | VMDK(sparse、split、快照链、ESXi seSparse) | `qemu-nbd --read-only`;链完整性先 `qemu-img info --backing-chain` |
+| ESXi datastore 本体 | VMFS 5/6 | `vmfs6-tools` 只读挂载(C,成熟),从 datastore 里取出 VMDK 再走上一行 |
+| PVE | qcow2 / raw(目录存储)、LVM-thin 卷、ZFS zvol、Ceph RBD | qcow2/raw 直接 NBD;LVM/zvol 是块设备天然只读可设;RBD 由 qemu-nbd 原生支持 |
+| Hyper-V(顺带覆盖) | VHD/VHDX | qemu-nbd 原生 |
+| 物理盘 | 整盘 / dd 镜像 | `blockdev --setro` + loop,或先 `ddrescue` 出镜像(坏道盘必须先镜像) |
+
+**文件系统层**(不自研文件系统恢复——重写 NTFS/APFS 恢复是以年计的工程,
+编排成熟工具并把 SOP 门禁包在外面才是产品价值):
+
+| 文件系统 | 场景 | 工具 |
+|---|---|---|
+| ext4 | Linux 服务器/开发机 | debugfs、ext4magic、extundelete、TSK |
+| XFS / btrfs | Linux 服务器 | TSK、btrfs restore(btrfs 快照本身是恢复源) |
+| NTFS | Windows 物理盘 | TSK 4.12、ntfsundelete;`ntfs` Rust crate 用于自研 MFT 深度解析 |
+| APFS / HFS+ | Mac | TSK 4.12(含 APFS 池);APFS 本地快照(Time Machine local)是第一恢复源 |
+| FAT/exFAT | U 盘、SD 卡 | TSK、photorec |
+| 任意(兜底) | 文件系统结构已毁 | photorec 按内容特征 carving(恢复等级只能到 B) |
+
+**诚实边界(恢复矩阵版):** BitLocker(Windows)与 FileVault(Mac)卷
+没有密钥/恢复密钥就是密文,产品只能做到"识别加密卷并索要密钥",不承诺破解;
+Apple T2 / Apple Silicon 内置 SSD 全程硬件加密,脱机恢复不可行,只能在原机
+可引导状态下操作(APFS 快照 + Target Disk Mode);SSD TRIM 后的块物理不可恢复
+——这条要在产品文案里说实话,不学数据恢复行业的普遍夸大。
+
+## 4. 语言选型(2026-07-30 定稿)
+
+**拦截侧:Rust。** 用户已拍板。seccomp unotify(`libseccomp-rs` /
+`seccomp-unotify` crate)与 eBPF(aya,纯 Rust 工具链,CO-RE 支持好)
+生态都成熟;监督器是常驻的特权进程,内存安全不是奢侈品。
+
+**恢复侧:也用 Rust。** Go 与 Rust 的对比结论:
+
+| 维度 | Go | Rust | 权重说明 |
+|---|---|---|---|
+| 解析损坏的二进制结构(VMDK 链、MFT、超级块) | 可行,但 slice 越界靠 runtime panic | binrw/zerocopy 生态,越界在类型层挡住 | **决定性**。恢复引擎的本质就是解析不可信的坏数据,C 取证工具的 CVE 史证明这里是内存 bug 高发区 |
+| 文件系统库生态 | TSK 需 cgo(痛),纯 Go 的 NTFS/APFS 库不成熟 | `ntfs` crate 生产可用,TSK FFI 绑定平顺,qcow2/vmdk 有纯 Rust 实现 | 中 |
+| 与拦截侧共享代码 | 两语言,策略/审计/哈希/隔离区逻辑写两遍 | 单语言单仓库,恢复模式复用拦截引擎做"证据只读"反向保护 | **高**。3.3 节的铁律 1 就是拦截引擎换个保护对象 |
+| 开发速度 / 团队经验(InfiniCode 是 Go) | 占优 | 学习成本真实存在 | 中,但主要惠及编排层,而编排层(向导、检查清单、调 qemu/TSK)体量小 |
+| 跨平台分发(Windows/Mac 物理盘场景要求本地运行) | 静态二进制,交叉编译佳 | 同样静态二进制,windows-rs / IOKit 绑定齐全 | 平手 |
+| 裸设备访问(`\\.\PhysicalDrive0`、`/dev/rdisk`) | syscall 包可做 | 同上 | 平手 |
+
+结论:Go 的优势集中在体量最小的编排层;Rust 的优势集中在最要命的解析层,
+且换来全产品单语言。**代价要说清:** 团队 Go 经验(InfiniCode/infinicd)
+用不上,M1 前期速度会慢;缓解办法是恢复侧大量复用外部成熟 C 工具
+(qemu-nbd、TSK、photorec、vmfs6-tools、ddrescue),自研 Rust 代码集中在
+镜像链校验、门禁验证、git 对象恢复、会话重放、报告与哈希清单这些"产品独有"
+部分。
+
+## 5. 组件架构
 
 ```
 infsec-policy.toml     签名库 + 保护目录 + 白名单 + 模式(enforce/observe)
@@ -184,21 +271,24 @@ infsec recover                 引导式取证恢复向导(M5)
 infsec audit / unlock          审计查询、人工带外解锁(M7)
 ```
 
-## 5. 里程碑
+## 6. 里程碑
 
 每个里程碑的验收都必须使用**无害样本**(见 AGENTS.md),完成一项停一项,
 经人工确认再继续。
 
 - **M0 — 计划与骨架(本次):** 本计划、README、AGENTS.md、git 初始化并推远端。
-- **M1 — seccomp 监督器 MVP(拦截):** `infsec run -- <cmd>` 拦截集生效;
-  签名 exec 硬拒;保护路径 unlink 先一律拒绝(此时还没有二审)。
+- **M1 — seccomp 监督器 MVP(拦截,Rust):** `infsec run -- <cmd>` 拦截集
+  生效;签名 exec 硬拒;保护路径 unlink 先一律拒绝(此时还没有二审)。
   验收:① `infsec run -- touch /tmp/infsec-probe-marker` 配专属签名被拒;
   ② 在 scratchpad 一次性 fixture 目录里(临时加入保护集)删 fixture 文件被拒;
   ③ 监督器被 kill 后被监督进程的受控操作不静默放行;④ observe 模式只记不拦。
-- **M2 — 二审通道(拦截):** `infsec-reviewd` 接 codex(后接 claude),
-  verdict JSON schema 校验,超时 fail-closed。验收全部在 fixture 目录:
-  构造"意图明显合理"与"意图明显无关"的两组删除,核对判决与审计记录;
-  拔掉 reviewer 验证 fail-closed。
+- **M2 — 风险分级 + 二审通道(拦截):** 备份态探测与 T0–T3 分级引擎;
+  `infsec-reviewd` 接 codex(后接 claude),verdict JSON schema 校验,
+  超时 fail-closed;T3 在双 CLI 可用时会签,否则拒绝转人工。
+  验收全部在 fixture 仓库(现造,含"有远端增量小 / 无远端 / 跨目录"三种
+  布局):同一删除操作在三种布局下分别命中 T1 放行、T2 二审、T3 会签;
+  构造"意图明显合理"与"意图明显无关"两组删除核对判决与审计;
+  拔掉 reviewer 验证 fail-closed;伪造过期 remote-tracking ref 验证降级 T2。
 - **M3 — 隔离区 + 爆发检测 + panic(恢复-事前/事中):** 放行删除进隔离区、
   `restore` 哈希一致;fixture 目录内高速批量删除触发 SIGSTOP,延迟 < 1s;
   `infsec panic` 冻结与最小写模式。全部样本为 fixture 文件。
@@ -210,20 +300,34 @@ infsec audit / unlock          审计查询、人工带外解锁(M7)
   绝不把开发机真实磁盘当验收对象。
 - **M6 — eBPF LSM 系统级(拦截):** 加 `lsm=bpf` 重启后,不经 `infsec run`
   的进程也受签名层与保护目录约束。验收先在虚拟机过全套,再上开发机。
-- **M7 — 严格模式、审计与解锁:** 双 Agent 会签;拒绝事件桌面通知;
-  `infsec unlock` 人工交互确认(不可被脚本喂入),一次性、限时、留审计;
-  ARCHITECTURE 文档,诚实边界段落全文档一致。
+- **M7 — 审计、通知与解锁:** 拒绝事件桌面通知;`infsec unlock` 人工交互
+  确认(不可被脚本喂入),一次性、限时、留审计;ARCHITECTURE 文档,
+  诚实边界段落全文档一致。
+- **M8 — 企业镜像与跨平台恢复:** 恢复对象矩阵(3.5)全量落地:
+  VMFS datastore(vmfs6-tools)、PVE 三种存储后端(qcow2 目录 / LVM-thin /
+  ZFS zvol,RBD 有条件则加)、NTFS 物理盘、APFS(TSK 4.12 + 本地快照);
+  `infsec recover` 出 Windows / macOS 构建。验收全部用现造 fixture 镜像
+  (每种格式一个,内置已知内容后模拟删除),恢复后哈希比对;
+  加密卷验收只验"正确识别并索要密钥",不做破解尝试。
 
-## 6. 开放问题(动手 M1 前要定)
+## 7. 已决策(2026-07-30)
 
-1. 二审延迟预算:同步挂起 syscall 期间 Agent 复核要 5–15s,被监督进程会卡住
-   ——对交互式 Agent 可接受,对批量任务需要 observe/async 折中模式吗?
-2. 保护目录集的初始默认值要不要直接读 `~/.claude/projects` 等位置自动发现?
-3. task_context 从哪来:要求 `infsec run --intent "..."` 显式声明,
-   还是允许为空(为空时二审只能更保守)?
-4. Rust 还是 Go:seccomp unotify 生态 Rust(`libseccomp-rs` + `seccomp_unotify`)
-   更成熟;Go 有 runtime 线程模型带来的 notify fd 处理坑。倾向 Rust,M1 前定稿。
-5. ext4(本机现状)拿不到原生快照,M4 的快照后端选 hardlink 增量、restic,
-   还是建议用户迁移 btrfs?需要一次磁盘布局评估。
-6. 恢复向导的交互形态:纯 TUI 检查清单,还是允许接入 Agent 对话式引导
-   (Agent 只读参谋模式)?
+1. **二审延迟:** 同步挂起 5–15s 可接受,高危操作值得等;T1 免二审保证日常无感。
+2. **风险自适应:** 拦截宽严跟随备份态(远端 git + 增量小 → T1 可信;
+   无远端 → T2 严格;跨目录 → T3 会签;家目录级递归删除 → T0 绝对拦截)。
+3. **语言:** 拦截 Rust;恢复也是 Rust(理由与代价见第 4 节),
+   文件系统级恢复编排成熟 C 工具、不自研。
+
+## 8. 开放问题(动手对应里程碑前要定)
+
+1. 保护目录集的初始默认值要不要直接读 `~/.claude/projects` 等位置自动发现?(M1)
+2. task_context 从哪来:要求 `infsec run --intent "..."` 显式声明,
+   还是允许为空(为空时二审只能更保守)?(M2)
+3. T1 阈值默认值(ahead ≤ 5 且最后 push < 24h)是否合适;`git ls-remote`
+   在线校验的超时与离线场景(无网络时 T1 是否一律降 T2)。(M2)
+4. ext4(本机现状)拿不到原生快照,M4 的快照后端选 hardlink 增量、restic,
+   还是建议用户迁移 btrfs?需要一次磁盘布局评估。(M4)
+5. 恢复向导的交互形态:纯 TUI 检查清单,还是允许接入 Agent 对话式引导
+   (Agent 只读参谋模式)?(M5)
+6. 批量/CI 场景是否需要 observe/async 折中模式(挂起改为记录+隔离区,
+   事后审):交互式 Agent 已确认不需要,企业 CI 待定。(M6 前)
