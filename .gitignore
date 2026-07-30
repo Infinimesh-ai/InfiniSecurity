@@ -1,0 +1,13 @@
+# 构建产物与本地状态
+target/
+bin/
+*.o
+*.bpf.o
+
+# 本地策略与运行时数据(含审计、隔离区索引)
+.infinisec-local/
+*.local.toml
+
+# 编辑器
+.vscode/
+.idea/
