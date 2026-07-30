@@ -65,6 +65,8 @@ seccomp 实现要点(M1 验收时逐条核对):
 - `dd`/`shred`/`wipefs`/`mkfs*`/`blkdiscard` 目标为块设备
 - `find ... -delete` / `git clean -fdx` 作用于保护目录根
 - `truncate -s 0`、`> ` 重定向由 syscall 层(O_TRUNC 门)兜住,不依赖命令文本
+- 被监督进程树内的 `sudo` / `su` / `pkexec` / `systemctl stop infinisecd`
+  → 提权与关防御尝试,默认 T3(见 5.0 特权模型)
 
 签名匹配的对象是 **execve 的 argv 向量**(逐参数匹配),不是拼接后的
 shell 字符串——避免引号/转义绕过;`bash -c "..."` 的内层命令在 exec 到
@@ -359,6 +361,39 @@ Apple T2 / Apple Silicon 内置 SSD 全程硬件加密,脱机恢复不可行,只
 
 ## 5. 组件架构
 
+### 5.0 特权模型(2026-07-30 决策:默认 root 部署)
+
+事故的直接证据:`rm -rf /` 以 dev 身份执行,所有 root 属主资产
+(Docker、系统目录)因**特权边界**而幸存。防御系统必须站在被监督用户的
+特权边界之外,否则 anti-tamper 不成立(同用户下 Agent 可 kill 守护进程、
+改写策略、ptrace 监督器)。root 部署不是加固选项,是安全模型的必要条件;
+eBPF LSM(M6)与 fanotify 权限事件本来也都要求特权。
+
+但"默认 root 部署"≠"整个系统跑 root",按最小特权切分:
+
+| 组件 | 身份 | 说明 |
+|---|---|---|
+| `infinisecd` 核心守护进程 | root(systemd 服务) | 唯一特权组件,体量最小化:判决引擎、策略持有、审计写入;systemd 加固(`ProtectSystem=strict` 白名单写路径、`NoNewPrivileges` 等) |
+| `infsec run` 启动器 | 被监督用户(非特权) | 只做一件事:装 seccomp filter,把 notify fd 经 unix socket(SCM_RIGHTS)递给 infinisecd 后即退出监督角色;自身被杀不影响已装上的 filter |
+| 二审 Agent(codex/claude) | **专用非特权用户** `infsec-review` | LLM 进程绝不跑 root:它的输出是数据不是指令,但它的进程可能被注入——只读挂载视角、无网络、无执行权,由 infinisecd 收 verdict 后自行执行判决 |
+| 策略 / 审计 / 隔离区 | root 属主,用户只读 | dev 身份物理上写不动;`protect remove` 与 unlock 经 infinisecd 的人工交互通道 |
+| 恢复向导 `infsec recover` | root(仅恢复会话期间) | 需要块设备访问;对证据设备强制只读由它自己的拦截层保证 |
+
+**fail-closed 语义随特权升级而增强:** M1 里"监督器被 kill 后不静默放行"
+的验收,在 root 模型下变成"被监督用户根本无法 kill 判决方"。
+
+**sudo 是边界上的洞,要显式处理:** 被监督进程树内 exec `sudo`/`su`/
+`pkexec` → 默认 T3(interactive 转人工,autonomous/ci 直接拒)——Agent
+要提权,本身就是最强风险信号之一。安装时检测被监督用户的 NOPASSWD
+sudoers 配置并常驻告警:**给 Agent 免密 sudo 等于亲手拆掉这道特权边界**
+(事故机 DevU24 恰好就配了免交互 sudo,那天只是碰巧没用上)。
+
+非 root 降级模式(无管理权限的受管笔记本等场景)保留为二等公民:
+纯 seccomp、策略防写靠拦截层自身,文档必须如实标注"同用户 kill 判决方
+= 操作被拒但保护随之失效"的边界。默认安装路径始终是 root。
+
+### 5.1 组件清单
+
 ```
 infsec-policy.toml     签名库 + 保护目录 + 白名单 + 模式(enforce/observe)
         │
@@ -381,11 +416,18 @@ infsec audit / unlock          审计查询、人工带外解锁(M7)
 经人工确认再继续。
 
 - **M0 — 计划与骨架(本次):** 本计划、README、AGENTS.md、git 初始化并推远端。
-- **M1 — seccomp 监督器 MVP(拦截,Rust):** `infsec run -- <cmd>` 拦截集
-  生效;签名 exec 硬拒;保护路径 unlink 先一律拒绝(此时还没有二审)。
+- **M1 — seccomp 监督器 MVP(拦截,Rust):** root 守护进程 `infinisecd`
+  (最小判决核)+ 非特权启动器 `infsec run -- <cmd>`(notify fd 经
+  SCM_RIGHTS 移交);拦截集生效;签名 exec 硬拒;保护路径 unlink 先一律
+  拒绝(此时还没有二审)。
   验收:① `infsec run -- touch /tmp/infsec-probe-marker` 配专属签名被拒;
   ② 在 scratchpad 一次性 fixture 目录里(临时加入保护集)删 fixture 文件被拒;
-  ③ 监督器被 kill 后被监督进程的受控操作不静默放行;④ observe 模式只记不拦。
+  ③ 以被监督用户身份 kill 启动器、尝试改策略文件、尝试 kill infinisecd,
+  三者均不导致静默放行(前两者操作失败,后者无权限);④ observe 模式只记不拦;
+  ⑤ 进程树内 exec `sudo` 被拦并审计(用无害 argv 样本验证,如
+  `sudo --version` 配签名规则)。
+  验收在虚拟机或容器内以真实双用户(root + 普通用户)布局跑,
+  不在开发机上直接装 root 服务。
 - **M2 — 风险分级 + 二审通道(拦截):** 备份态探测、路径语义分级(S0–S4)、
   发起者情景与 T0–T3 合成引擎;**操作级合并判决与判决缓存**(2.4.4,
   性能生死线);`infsec-reviewd` 接 codex(后接 claude),verdict JSON
@@ -429,12 +471,15 @@ infsec audit / unlock          审计查询、人工带外解锁(M7)
 4. **保护目录集统一管理(2.4.2a):** 单一事实源由 infsec 集中持有,
    内置默认集开箱即用;Agent 只读;发现器只产建议、人工确认生效;
    remove 等同解锁操作;策略/审计/隔离区/二进制自身入 S4 自保护。
+5. **默认 root 部署(5.0):** 防御系统与被监督用户之间必须隔一道特权
+   边界(事故中 root 属主资产幸存即证据);root 面按最小特权切分,
+   二审 LLM 绝不跑 root;进程树内提权尝试默认 T3;非 root 是降级模式。
 
 ## 8. 开放问题(动手对应里程碑前要定)
 
-1. ~~保护目录集默认值与发现~~ 已决策,见 2.4.2a 与第 7 节。遗留实现细节:
-   非 root 部署时策略文件如何防被监督进程写(M1 用 seccomp 拦对策略路径的
-   写 syscall 即可;M6 系统级后由 LSM 兜底)。(M1)
+1. ~~保护目录集默认值与发现、策略防写~~ 已决策:统一管理(2.4.2a)+
+   root 默认部署(5.0),策略文件 root 属主物理防写。遗留:非 root 降级
+   模式做到什么程度——M1 一并实现还是推迟到有真实需求?(M1)
 2. task_context 从哪来:要求 `infsec run --intent "..."` 显式声明,
    还是允许为空(为空时二审只能更保守)?(M2)
 3. T1 阈值默认值(ahead ≤ 5 且最后 push < 24h)是否合适;`git ls-remote`
