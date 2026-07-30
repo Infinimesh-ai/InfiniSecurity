@@ -1,0 +1,143 @@
+//! infsec — 非特权启动器(PLAN 5.0)。
+//!
+//! `infsec run [--intent "..."] [--profile p] -- <cmd> [args...]`
+//!
+//! 只做一件事:连 infinisecd → 发 hello → 装 seccomp filter(带
+//! NO_NEW_PRIVS)→ SCM_RIGHTS 移交 notify fd → 收 ack → exec 目标命令。
+//! exec 之后本进程就是被监督进程树的根;filter 由内核保证子进程继承、
+//! 进程自身无法摘除。
+//!
+//! fail-closed 契约:daemon 不可达 / 握手任何一步失败 → 拒绝启动目标
+//! 命令并以非零码退出。绝不"降级为无监督执行"。
+
+use anyhow::{bail, Context, Result};
+use infsec_common::fdpass;
+use infsec_common::protocol::{SessionAck, SessionHello, DEFAULT_SOCKET_PATH, PROTOCOL_VERSION};
+use infsec_common::seccomp;
+use std::ffi::CString;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream;
+
+fn main() {
+    match real_main() {
+        Ok(()) => unreachable!("exec 成功后不会返回"),
+        Err(e) => {
+            eprintln!("infsec: {e:#}");
+            std::process::exit(125);
+        }
+    }
+}
+
+fn usage() -> ! {
+    eprintln!("用法:");
+    eprintln!("  infsec run [--socket S] [--intent TEXT] [--profile NAME] -- <cmd> [args...]");
+    eprintln!("  infsec version");
+    std::process::exit(2);
+}
+
+fn real_main() -> Result<()> {
+    let argv: Vec<String> = std::env::args().collect();
+    match argv.get(1).map(String::as_str) {
+        Some("run") => {}
+        Some("version") | Some("--version") => {
+            println!("infsec {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        _ => usage(),
+    }
+
+    let mut socket = std::env::var("INFSEC_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.into());
+    let mut intent: Option<String> = None;
+    let mut profile = "interactive".to_string();
+    let mut cmd: Vec<String> = Vec::new();
+
+    let mut it = argv.iter().skip(2);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--socket" => socket = it.next().map(String::clone).unwrap_or_else(|| usage()),
+            "--intent" => intent = Some(it.next().map(String::clone).unwrap_or_else(|| usage())),
+            "--profile" => profile = it.next().map(String::clone).unwrap_or_else(|| usage()),
+            "--" => {
+                cmd = it.map(String::clone).collect();
+                break;
+            }
+            other => {
+                eprintln!("infsec: 未知参数 {other}");
+                usage();
+            }
+        }
+    }
+    if cmd.is_empty() {
+        eprintln!("infsec: 缺少目标命令(-- 之后)");
+        usage();
+    }
+
+    // 1. 连接 daemon。失败即 fail-closed:不存在"无监督降级执行"。
+    let mut stream = UnixStream::connect(&socket).with_context(|| {
+        format!(
+            "无法连接 infinisecd({socket});fail-closed,拒绝启动目标命令。\
+             请确认 infinisecd 服务在运行"
+        )
+    })?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+
+    // 2. hello
+    let hello = SessionHello {
+        version: PROTOCOL_VERSION,
+        pid: std::process::id() as i32,
+        cwd: std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "?".into()),
+        argv: cmd.clone(),
+        intent,
+        profile,
+    };
+    writeln!(stream, "{}", serde_json::to_string(&hello)?)?;
+
+    // 3. 装 filter(此刻起本进程已在拦截集内)并拿 notify fd
+    let notify_fd = seccomp::install_filter_with_listener()
+        .context("安装 seccomp filter 失败")?;
+
+    // 4. 移交 notify fd
+    fdpass::send_fd_stream(&stream, notify_fd.as_raw_fd())
+        .context("移交 notify fd 失败;fail-closed,拒绝继续")?;
+
+    // 5. 等 ack:确认 daemon 已接管监督,才允许 exec
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .context("等待 daemon 确认失败;fail-closed,拒绝继续")?;
+    let ack: SessionAck = serde_json::from_str(line.trim()).context("ack 解析失败")?;
+    if !ack.ok {
+        bail!(
+            "daemon 拒绝会话: {}",
+            ack.error.unwrap_or_else(|| "未知原因".into())
+        );
+    }
+
+    // 本进程持有的 notify fd 副本必须关闭:daemon 是唯一判决方。
+    drop(notify_fd);
+    // stream 带 CLOEXEC,exec 后自动关闭;监督生命周期由 notify fd 决定。
+
+    // 6. exec。这次 execve 本身就是第一个被判决的事件。
+    let c_argv: Vec<CString> = cmd
+        .iter()
+        .map(|s| CString::new(s.as_str()).context("参数含 NUL"))
+        .collect::<Result<_>>()?;
+    let mut ptrs: Vec<*const libc::c_char> = c_argv.iter().map(|c| c.as_ptr()).collect();
+    ptrs.push(std::ptr::null());
+    unsafe { libc::execvp(ptrs[0], ptrs.as_ptr()) };
+
+    // execvp 只在失败时返回
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EPERM) {
+        bail!(
+            "目标命令被 infinisecd 拒绝执行(EPERM,签名层命中)。\
+             详情见审计日志(会话 {})",
+            ack.session.as_deref().unwrap_or("?")
+        );
+    }
+    bail!("exec {:?} 失败: {err}", cmd[0])
+}

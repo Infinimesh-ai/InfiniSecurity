@@ -1,0 +1,79 @@
+# InfiniSecurity 策略(M1 出厂模板)
+# root 属主 0644;被监督用户只读。修改 = 重启 infinisecd(重启入审计)。
+# @SUPERVISED_HOME@ 由 install-vm.sh 替换为被监督用户的 home。
+
+mode = "enforce"          # enforce | observe(observe 只记审计,一律放行)
+audit_log = "/var/log/infinisec/audit.jsonl"
+
+[protect]
+# 保护目录集(PLAN 2.4.2a:单一事实源,默认集内置)。
+# ~ 按被监督用户展开;匹配为规范化绝对路径的目录边界前缀。
+paths = [
+    "@SUPERVISED_HOME@/Documents",
+    "@SUPERVISED_HOME@/.claude",
+    "@SUPERVISED_HOME@/.codex",
+    "@SUPERVISED_HOME@/.ssh",
+    "@SUPERVISED_HOME@/.gnupg",
+    # infsec 自身(S4 自保护):策略、审计、隔离区
+    "/etc/infinisec",
+    "/var/log/infinisec",
+    "/var/lib/infinisec",
+]
+# 任意位置的 .git 目录(仓库历史,事故中最痛的损失)
+git_dirs = true
+
+# ---- 签名库(PLAN 2.2):命中即 EPERM,不进二审,Agent 不可申诉 ----
+# 匹配对象是 execve 的 argv 向量,逐参数匹配。
+# 规则内的命令字符串是匹配模式(数据),不是可执行样本。
+
+# 验收专属无害签名(AGENTS.md 纪律 1 的标准样本)。
+# 保留在出厂策略里:每台部署机随时可以无害地自检拦截链路。
+[[signature]]
+name = "infsec-probe"
+exe = ["touch"]
+args_any = ["/tmp/infsec-probe-marker"]
+reason = "无害验收探针:验证拦截链路端到端生效"
+
+[[signature]]
+name = "recursive-force-protected-root"
+exe = ["rm"]
+flag_groups = [["-r", "-R", "--recursive"], ["-f", "--force"]]
+target_protected_root = true
+reason = "递归强制删除 /、$HOME 或保护目录根"
+
+[[signature]]
+name = "no-preserve-root"
+exe = ["rm"]
+args_any = ["--no-preserve-root"]
+reason = "显式解除根保护,无正当使用场景"
+
+[[signature]]
+name = "block-device-write"
+exe = ["dd", "shred", "wipefs", "blkdiscard", "mkfs", "mkfs.ext4", "mkfs.xfs", "mkfs.btrfs", "mkfs.vfat", "mkfs.exfat", "mkswap"]
+arg_prefix_any = ["/dev/sd", "/dev/nvme", "/dev/vd", "/dev/hd", "/dev/mmcblk", "/dev/dm-", "/dev/mapper/", "/dev/md", "of=/dev/"]
+reason = "对块设备的写入/擦除/格式化"
+
+[[signature]]
+name = "find-delete-protected-root"
+exe = ["find"]
+flag_groups = [["-delete"]]
+target_protected_root = true
+reason = "find -delete 作用于保护目录根"
+
+[[signature]]
+name = "git-clean-force-protected-root"
+exe = ["git"]
+flag_groups = [["clean"], ["-f", "-fd", "-fdx", "-ffdx", "--force"]]
+target_protected_root = true
+reason = "git clean 强制清理保护目录根"
+
+[[signature]]
+name = "priv-escalation"
+exe = ["sudo", "su", "pkexec", "doas"]
+reason = "被监督进程树内提权尝试,默认 T3(M1:拒绝并审计;PLAN 5.0)"
+
+[[signature]]
+name = "stop-defense"
+exe = ["systemctl"]
+flag_groups = [["stop", "disable", "mask", "kill"], ["infinisecd", "infinisecd.service"]]
+reason = "尝试关停防御系统(anti-tamper,PLAN 2.4.2a)"

@@ -1,0 +1,45 @@
+# infinisecd — InfiniSecurity 判决守护进程(唯一特权组件,PLAN 5.0)
+# 安装:install-vm.sh;仅用于虚拟机/容器验收环境,M1 阶段不装开发机。
+
+[Unit]
+Description=InfiniSecurity supervisor daemon (seccomp unotify verdict core)
+Documentation=https://github.com/Infinimesh-ai/InfiniSecurity
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/infinisecd --policy /etc/infinisec/policy.toml
+Restart=always
+RestartSec=1
+
+# ---- 最小特权加固 ----
+# 需要保留的能力:
+#   CAP_SYS_PTRACE      process_vm_readv 读被监督进程内存 + /proc/<pid>/cwd|fd
+#   CAP_DAC_READ_SEARCH 对任意路径做存在性/元数据检查
+#   CAP_KILL            M3 爆发检测的 SIGSTOP(预留)
+#   CAP_CHOWN/FOWNER    审计与运行目录属主管理
+CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_KILL CAP_CHOWN CAP_FOWNER
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/log/infinisec /var/lib/infinisec
+RuntimeDirectory=infinisec
+RuntimeDirectoryMode=0755
+LogsDirectory=infinisec
+StateDirectory=infinisec
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+# 不设 PrivateDevices:M5 恢复模式需要块设备可见性(届时单独评估)
+
+[Install]
+WantedBy=multi-user.target
