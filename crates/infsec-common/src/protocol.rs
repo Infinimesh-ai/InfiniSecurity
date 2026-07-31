@@ -31,9 +31,14 @@ pub struct SessionHello {
     /// 任务意图声明(M2 起进入二审证据包;M1 只入审计)。
     #[serde(default)]
     pub intent: Option<String>,
-    /// 发起者情景(PLAN 2.4.3);M1 只记录。
+    /// 发起者情景(PLAN 2.4.3)。
     #[serde(default = "default_profile")]
     pub profile: String,
+    /// `--may-delete` 预授权清单(PLAN 2.4.4 之三)。
+    /// 声明范围内的删除免二审,越界按 T2/T3 处理——越出自己声明的范围
+    /// 本身就是最强的风险信号。声明入审计,事后可对账。
+    #[serde(default)]
+    pub may_delete: Vec<String>,
 }
 
 fn default_profile() -> String {
@@ -50,4 +55,37 @@ pub struct SessionAck {
     /// daemon 生成的会话 id,审计记录用它串联。
     #[serde(default)]
     pub session: Option<String>,
+}
+
+// ---- 控制通道(不带 fd 的连接)----
+
+/// 控制命令。daemon 按 SO_PEERCRED 的 uid 授权:
+/// 每个用户只能操作自己 home 下的隔离区,root 之外没有例外。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "cmd", rename_all = "kebab-case")]
+pub enum ControlRequest {
+    /// daemon 状态与策略摘要。
+    Status,
+    /// 列出隔离区批次;给了 stamp 就列该批次的条目。
+    QuarantineList { #[serde(default)] stamp: Option<String> },
+    /// 从隔离区恢复一个文件。
+    QuarantineRestore { stamp: String, path: String },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ControlResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub lines: Vec<String>,
+}
+
+impl ControlResponse {
+    pub fn ok(lines: Vec<String>) -> ControlResponse {
+        ControlResponse { ok: true, error: None, lines }
+    }
+    pub fn err(msg: impl Into<String>) -> ControlResponse {
+        ControlResponse { ok: false, error: Some(msg.into()), lines: vec![] }
+    }
 }

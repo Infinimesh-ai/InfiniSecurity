@@ -16,12 +16,21 @@ RestartSec=1
 # 需要保留的能力:
 #   CAP_SYS_PTRACE      process_vm_readv 读被监督进程内存 + /proc/<pid>/cwd|fd
 #   CAP_DAC_READ_SEARCH 对任意路径做存在性/元数据检查
+#   CAP_DAC_OVERRIDE    把删除目标移入 root 属主的隔离区
 #   CAP_KILL            M3 爆发检测的 SIGSTOP(预留)
 #   CAP_CHOWN/FOWNER    审计与运行目录属主管理
-CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_KILL CAP_CHOWN CAP_FOWNER
+#   CAP_SETUID/SETGID   **降权跑子进程必需**:git 备份态探测与二审 Agent
+#                       都必须降到非 root 身份(backup.rs 纪律二、PLAN 5.0)。
+#                       少了这两个,降权 setuid 直接失败,子进程一个也起不来
+#                       ——M2 验收里 T1 被误判成 T2 就是栽在这儿,而且失败
+#                       是静默的:探测失败只表现为"降级到更严的等级"。
+CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_KILL CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/var/log/infinisec /var/lib/infinisec
+# /home 必须可写:隔离区要落在被保护数据的同一个文件系统上。
+# ProtectSystem 会为此造一个 bind mount,视图一致性检查按"底层文件是否
+# 同一个"比对(见 tracee.rs MountView),所以加固与判决可以并存。
+ReadWritePaths=/var/log/infinisec /var/lib/infinisec /home
 RuntimeDirectory=infinisec
 RuntimeDirectoryMode=0755
 LogsDirectory=infinisec
@@ -32,9 +41,11 @@ StateDirectory=infinisec
 # daemon 眼里那些文件全都"不存在",于是"截断已有文件"被当成"新建文件"
 # 放行——M1 验收里 PrivateTmp=yes 就是这样漏掉一次 O_TRUNC 的。
 # 现在 daemon 会在会话开始时自检视图一致性并整会话 fail-closed,
-# 但正确的部署本来就不该触发它。ProtectHome=read-only 只改权限、
-# 不换挂载视图,可以保留。
-ProtectHome=read-only
+# 但正确的部署本来就不该触发它。
+#
+# 不设 ProtectHome:隔离区必须与被保护数据在**同一个文件系统**上,
+# 否则移入隔离区会 EXDEV,而我们不做非原子的复制回退(见 quarantine.rs)。
+# 这意味着隔离区只能落在用户 home 下,daemon 必须能写进去。
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectKernelLogs=yes

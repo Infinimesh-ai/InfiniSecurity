@@ -394,6 +394,19 @@ pub fn resp_allow_continue(id: u64) -> SeccompNotifResp {
     }
 }
 
+/// 合成成功:syscall **不执行**,直接返回 0。
+///
+/// 隔离区放行走这条路(PLAN 3.1):daemon 自己把文件原子移入隔离区,
+/// 然后告诉被监督进程"删除成功了"。让真删除发生就没有隔离区可言了。
+pub fn resp_emulated_success(id: u64) -> SeccompNotifResp {
+    SeccompNotifResp {
+        id,
+        val: 0,
+        error: 0,
+        flags: 0,
+    }
+}
+
 pub fn resp_deny_eperm(id: u64) -> SeccompNotifResp {
     SeccompNotifResp {
         id,

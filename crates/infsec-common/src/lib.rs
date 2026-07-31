@@ -8,9 +8,11 @@
 
 pub mod audit;
 pub mod fdpass;
+pub mod pathclass;
 pub mod paths;
 pub mod policy;
 pub mod protocol;
+pub mod risk;
 pub mod seccomp;
 pub mod signature;
 

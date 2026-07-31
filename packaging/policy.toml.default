@@ -77,3 +77,40 @@ name = "stop-defense"
 exe = ["systemctl"]
 flag_groups = [["stop", "disable", "mask", "kill"], ["infinisecd", "infinisecd.service"]]
 reason = "尝试关停防御系统(anti-tamper,PLAN 2.4.2a)"
+
+# ---- M2:风险分级(PLAN 2.4)----
+[risk]
+# T1 可信阈值:有远端 + 未推提交 ≤ 5 + 最后提交 < 24h
+t1_max_ahead = 5
+t1_max_push_age_secs = 86400
+# 二审置信度阈值;低于此值的 allow 按 deny 处理
+min_confidence = 0.8
+# 二审超时(秒),超时 = deny(fail-closed 无例外)
+review_timeout_secs = 15
+cosign_timeout_secs = 30
+# 判决缓存(PLAN 2.4.4 之二):千次 unlink → 一次判决
+grant_ttl_secs = 600
+grant_max_files = 500
+grant_max_bytes = 1073741824
+
+# ---- 隔离区(PLAN 3.1)----
+[quarantine]
+# 放行的删除不真删,先移入 ~/.infinisec/quarantine。
+# T1 敢免二审的底气就是"错了能恢复",所以这里默认开。
+enabled = true
+keep_days = 7
+
+# ---- 二审后端(PLAN 2.3 / 5.0)----
+# 每个后端必须声明非特权运行用户:LLM 进程绝不跑 root。
+# 未配置任何后端时,所有需二审的操作一律 fail-closed 拒绝。
+# 装好 codex / claude CLI 后取消注释并确认 infsec-review 用户存在。
+#
+# [[reviewer]]
+# name = "codex"
+# argv = ["/usr/bin/codex", "exec", "--sandbox", "read-only", "-"]
+# run_as = "infsec-review"
+#
+# [[reviewer]]
+# name = "claude"
+# argv = ["/usr/local/bin/claude", "-p", "--allowedTools", ""]
+# run_as = "infsec-review"

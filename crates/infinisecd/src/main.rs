@@ -10,6 +10,11 @@
 //! daemon 崩溃/被杀时,内核会关闭 notify fd,被拦截的 syscall 全部
 //! 返回 ENOSYS——fail-closed 由内核语义兜底,不依赖本进程善后。
 
+mod backup;
+mod merge;
+mod pipeline;
+mod quarantine;
+mod review;
 mod tracee;
 mod verdict;
 
@@ -18,7 +23,9 @@ use infsec_common::audit::{now_rfc3339, AuditLog, AuditRecord};
 use infsec_common::fdpass;
 use infsec_common::paths::ProtectedSet;
 use infsec_common::policy::{Mode, Policy};
-use infsec_common::protocol::{SessionAck, SessionHello, DEFAULT_SOCKET_PATH};
+use infsec_common::protocol::{
+    ControlRequest, ControlResponse, SessionAck, SessionHello, DEFAULT_SOCKET_PATH,
+};
 use infsec_common::seccomp::{self, RecvResult, SeccompNotif};
 use infsec_common::Verdict;
 use std::io::Write;
@@ -147,6 +154,25 @@ fn peer_cred(stream: &UnixStream) -> Result<(u32, i32)> {
     Ok((cred.uid, cred.pid))
 }
 
+fn gid_of_uid(uid: u32) -> Option<u32> {
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0u8; 4096];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut pwd,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() {
+        return None;
+    }
+    Some(pwd.pw_gid)
+}
+
 fn home_of_uid(uid: u32) -> Result<PathBuf> {
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0u8; 4096];
@@ -177,6 +203,26 @@ struct Session {
     /// "我看到的就是它要动的那个文件";确认不了就拒
     /// (见 tracee::MountView 的注释)。None = 读不到挂载表,全拒。
     mounts: Option<(tracee::MountView, tracee::MountView)>,
+    /// 被监督用户 home(隔离区落点)。
+    home: PathBuf,
+    /// 会话情景(PLAN 2.4.3),认不出的取最严。
+    profile: infsec_common::risk::Profile,
+    /// 任务意图声明(证据包用)。
+    intent: String,
+    /// 会话根:启动器 cwd 所属仓库,判跨界用。
+    session_root: Option<PathBuf>,
+    /// `--may-delete` 预授权清单。
+    may_delete: Vec<String>,
+    /// 启动器 cwd(相对预授权模式的基准)。
+    cwd: PathBuf,
+    /// 备份态探测器(带缓存)。
+    probe: backup::BackupProbe,
+    /// 会话内的判决授权表(不跨进程树)。
+    grants: std::sync::Mutex<merge::GrantTable>,
+    /// M2 流水线配置。
+    pipeline: pipeline::PipelineConfig,
+    /// 隔离批次序号。
+    batch_seq: AtomicU64,
 }
 
 impl Session {
@@ -189,6 +235,62 @@ impl Session {
     }
 }
 
+/// 从策略构造流水线配置。二审后端的降权用户在这里解析——
+/// 解析不了就不注册该后端(= 该等级的复核不可用 = fail-closed 拒绝)。
+fn build_pipeline(policy: &Policy) -> pipeline::PipelineConfig {
+    let reviewers = policy
+        .reviewers
+        .iter()
+        .filter_map(|rc| match uid_gid_of(&rc.run_as) {
+            Some((uid, gid)) => Some(review::Reviewer {
+                name: rc.name.clone(),
+                argv: rc.argv.clone(),
+                run_as_uid: Some(uid),
+                run_as_gid: Some(gid),
+            }),
+            None => {
+                eprintln!(
+                    "infinisecd: ⚠ 二审后端 {} 的用户 {} 不存在,该后端不可用",
+                    rc.name, rc.run_as
+                );
+                None
+            }
+        })
+        .collect();
+    pipeline::PipelineConfig {
+        reviewers,
+        min_confidence: policy.risk.min_confidence,
+        review_timeout: policy.risk.review_timeout(),
+        cosign_timeout: policy.risk.cosign_timeout(),
+        grant_limits: merge::GrantLimits {
+            ttl: policy.risk.grant_ttl(),
+            max_files: policy.risk.grant_max_files,
+            max_bytes: policy.risk.grant_max_bytes,
+        },
+        quarantine_enabled: policy.quarantine.enabled,
+    }
+}
+
+fn uid_gid_of(user: &str) -> Option<(u32, u32)> {
+    let name = std::ffi::CString::new(user).ok()?;
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0u8; 4096];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getpwnam_r(
+            name.as_ptr(),
+            &mut pwd,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() {
+        return None;
+    }
+    Some((pwd.pw_uid, pwd.pw_gid))
+}
+
 fn handle_session(
     mut stream: UnixStream,
     policy: Arc<Policy>,
@@ -198,9 +300,12 @@ fn handle_session(
     stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
     let (uid, peer_pid) = peer_cred(&stream)?;
 
-    // hello 与 notify fd 在同一条消息里(见 protocol.rs:分两次读会丢 fd)。
-    let (payload, notify_fd): (Vec<u8>, OwnedFd) =
-        fdpass::recv_with_fd_stream(&stream).context("接收 hello + notify fd 失败")?;
+    // 一条消息:带 fd 的是监督会话,不带的是控制命令。
+    let (payload, maybe_fd) =
+        fdpass::recv_maybe_fd_stream(&stream).context("接收首条消息失败")?;
+    let Some(notify_fd): Option<OwnedFd> = maybe_fd else {
+        return handle_control(&mut stream, &policy, uid, payload.trim_ascii_end());
+    };
     let hello: SessionHello =
         serde_json::from_slice(payload.trim_ascii_end()).context("hello 解析失败")?;
 
@@ -238,6 +343,14 @@ fn handle_session(
         }
     };
 
+    let cwd = tracee::proc_readlink(peer_pid, "cwd").unwrap_or_else(|_| PathBuf::from(&hello.cwd));
+    // git 探测降权到被监督用户(见 backup.rs 纪律二)
+    let gid = gid_of_uid(uid).unwrap_or(uid);
+    let probe = backup::BackupProbe::for_user(uid, gid);
+    let session_root = probe.repo_state(&cwd).map(|r| r.toplevel).or(Some(cwd.clone()));
+    let profile = infsec_common::risk::Profile::parse(&hello.profile);
+    let pipeline_cfg = build_pipeline(&policy);
+
     let session = Session {
         id: sid,
         uid,
@@ -245,6 +358,16 @@ fn handle_session(
         policy,
         audit,
         mounts,
+        home: home.clone(),
+        profile,
+        intent: hello.intent.clone().unwrap_or_default(),
+        session_root,
+        may_delete: hello.may_delete.clone(),
+        cwd,
+        probe,
+        grants: std::sync::Mutex::new(merge::GrantTable::default()),
+        pipeline: pipeline_cfg,
+        batch_seq: AtomicU64::new(1),
     };
 
     session.audit.write(&AuditRecord {
@@ -387,6 +510,33 @@ fn decide_and_respond(session: &Session, fd: i32, notif: &SeccompNotif) {
         signatures: &session.policy.signatures,
     };
     let verdict = core.decide(&event);
+
+    // M2:保护集命中但不是签名层命中 → 进风险分级 + 二审流水线,
+    // 而不是像 M1 那样一律拒。签名层的 deny 直接落地,不进流水线。
+    let verdict = match &verdict {
+        Verdict::Deny { rule } if !rule.starts_with("signature:") => {
+            match run_pipeline(session, notif, &event, rule) {
+                PipelineResult::Deny(why) => Verdict::Deny { rule: why },
+                PipelineResult::AllowDirect(why) => {
+                    respond_allow(session, fd, notif, argv.as_deref(), &paths, &why);
+                    return;
+                }
+                PipelineResult::AllowQuarantined(why) => {
+                    // 文件已被 daemon 移入隔离区,syscall 不必真跑
+                    if !seccomp::notif_id_valid(fd, notif.id) {
+                        audit_syscall(session, notif, argv.as_deref(), &paths, "stale", None,
+                            Some("隔离后 notify id 复验失败"));
+                        return;
+                    }
+                    let _ = seccomp::notif_send(fd, &seccomp::resp_emulated_success(notif.id));
+                    audit_syscall(session, notif, argv.as_deref(), &paths, "allow-quarantined",
+                        Some(rule), Some(&why));
+                    return;
+                }
+            }
+        }
+        v => v.clone(),
+    };
 
     let enforce = session.policy.mode == Mode::Enforce;
     match (&verdict, enforce) {
@@ -559,4 +709,235 @@ fn audit_syscall(
         rule,
         note,
     });
+}
+
+// ---- M2 流水线接入 ----
+
+enum PipelineResult {
+    /// 放行,syscall 照常执行。
+    AllowDirect(String),
+    /// 放行,但内容已由 daemon 移入隔离区/已快照。
+    AllowQuarantined(String),
+    Deny(String),
+}
+
+/// 把一个命中保护集的事件送进 M2 流水线。
+fn run_pipeline(
+    session: &Session,
+    notif: &SeccompNotif,
+    event: &verdict::Event,
+    protect_rule: &str,
+) -> PipelineResult {
+    let pid = notif.pid as i32;
+    let (op, target) = match event {
+        verdict::Event::Remove { path } => (merge::OpKind::Remove, path.shown().to_path_buf()),
+        verdict::Event::Rename { from, .. } => (merge::OpKind::Rename, from.shown().to_path_buf()),
+        verdict::Event::Truncate { path, .. } => {
+            (merge::OpKind::Truncate, path.shown().to_path_buf())
+        }
+        // exec 与非路径截断不该走到这里
+        _ => return PipelineResult::Deny("非路径事件误入流水线".into()),
+    };
+
+    // 三个维度的探测
+    let git_state = session.probe.git_state(&target);
+    let path_class = infsec_common::pathclass::classify(&target, git_state);
+    let thresholds = match session.profile {
+        infsec_common::risk::Profile::Autonomous => backup::T1Thresholds {
+            max_ahead: session.policy.risk.t1_max_ahead,
+            max_push_age: session.policy.risk.t1_max_push_age(),
+        }
+        .halved(),
+        _ => backup::T1Thresholds {
+            max_ahead: session.policy.risk.t1_max_ahead,
+            max_push_age: session.policy.risk.t1_max_push_age(),
+        },
+    };
+    let base_tier = session
+        .probe
+        .repo_state(&target)
+        .map(|r| r.tier(&thresholds))
+        // 不在任何仓库里 = 没有 git 这层恢复网
+        .unwrap_or(infsec_common::risk::Tier::T2);
+    let cross = backup::is_cross_boundary(session.session_root.as_deref(), &target);
+    let tier = pipeline::backup_tier_with_boundary(base_tier, cross);
+
+    let preauth = pipeline::preauthorized(&session.may_delete, &session.cwd, &target);
+
+    let risk = infsec_common::risk::RiskInput {
+        backup_tier: tier,
+        path_class,
+        profile: session.profile,
+        signature_hit: false,
+        preauthorized: preauth,
+    };
+
+    let evidence = review::Evidence {
+        syscall: seccomp::syscall_name(notif.data.nr as u32).to_string(),
+        resolved_paths: vec![target.display().to_string()],
+        argv: vec![],
+        cwd: session.cwd.display().to_string(),
+        process_chain: pipeline::process_chain(pid, 8),
+        recent_audit: vec![format!("命中保护集: {protect_rule}")],
+        task_context: session.intent.clone(),
+        risk_level: format!("{}×{}", tier.as_str(), path_class.as_str()),
+    };
+
+    let decision = pipeline::Decision {
+        op,
+        path: &target,
+        size: pipeline::size_of(&target),
+        risk,
+        evidence,
+    };
+
+    let outcome = {
+        let mut grants = session.grants.lock().unwrap();
+        pipeline::decide(&session.pipeline, &mut grants, &decision)
+    };
+
+    match outcome {
+        pipeline::Outcome::Deny { why } => PipelineResult::Deny(why),
+        pipeline::Outcome::Allow { after: pipeline::AfterAllow::Direct, why } => {
+            PipelineResult::AllowDirect(why)
+        }
+        pipeline::Outcome::Allow { after: pipeline::AfterAllow::Quarantine, why } => {
+            let stamp = pipeline::batch_stamp(session.batch_seq.fetch_add(1, Ordering::Relaxed));
+            match op {
+                // 删除:先把文件保全进隔离区,再决定怎么回应 syscall
+                merge::OpKind::Remove => match quarantine::preserve(&session.home, &target, &stamp) {
+                    // 已原子移走,syscall 不必真跑
+                    Ok(quarantine::Preserved::Moved(dest)) => PipelineResult::AllowQuarantined(
+                        format!("{why};已隔离至 {}", dest.display()),
+                    ),
+                    // 跨文件系统只复制了副本,原件还在,真 syscall 要照常执行
+                    Ok(quarantine::Preserved::Copied(dest)) => PipelineResult::AllowDirect(format!(
+                        "{why};跨文件系统,已复制副本至 {}(属主/xattr 不保留)",
+                        dest.display()
+                    )),
+                    // 保全失败就不放行——"放行"的前提是错了能恢复
+                    Err(e) => PipelineResult::Deny(format!("{why};但隔离区写入失败,拒绝放行: {e}")),
+                },
+                // 截断/移出:syscall 必须真跑(语义不同),先留快照
+                merge::OpKind::Truncate | merge::OpKind::Rename => {
+                    match quarantine::snapshot(&session.home, &target, &stamp) {
+                        Ok(dest) => PipelineResult::AllowDirect(format!(
+                            "{why};已快照至 {}", dest.display()
+                        )),
+                        Err(e) => {
+                            PipelineResult::Deny(format!("{why};但快照失败,拒绝放行: {e}"))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn respond_allow(
+    session: &Session,
+    fd: i32,
+    notif: &SeccompNotif,
+    argv: Option<&[String]>,
+    paths: &[String],
+    why: &str,
+) {
+    if !seccomp::notif_id_valid(fd, notif.id) {
+        audit_syscall(session, notif, argv, paths, "stale", None, Some("放行前复验失败"));
+        return;
+    }
+    let _ = seccomp::notif_send(fd, &seccomp::resp_allow_continue(notif.id));
+    audit_syscall(session, notif, argv, paths, "allow", None, Some(why));
+}
+
+// ---- 控制通道 ----
+
+/// 处理一条控制命令。
+///
+/// 授权模型很简单也很硬:一切以 SO_PEERCRED 的 uid 为准,每个用户
+/// 只能看/恢复自己 home 下的隔离区。命令里没有"指定用户"这种参数,
+/// 因为那就等于把授权决定交给了请求方。
+fn handle_control(
+    stream: &mut UnixStream,
+    policy: &Policy,
+    uid: u32,
+    payload: &[u8],
+) -> Result<()> {
+    let resp = match serde_json::from_slice::<ControlRequest>(payload) {
+        Ok(req) => dispatch_control(policy, uid, req),
+        Err(e) => ControlResponse::err(format!("控制命令解析失败: {e}")),
+    };
+    writeln!(stream, "{}", serde_json::to_string(&resp)?)?;
+    Ok(())
+}
+
+fn dispatch_control(policy: &Policy, uid: u32, req: ControlRequest) -> ControlResponse {
+    let home = match home_of_uid(uid) {
+        Ok(h) => h,
+        Err(e) => return ControlResponse::err(format!("解析 home 失败: {e}")),
+    };
+    match req {
+        ControlRequest::Status => ControlResponse::ok(vec![
+            format!("infinisecd {}", env!("CARGO_PKG_VERSION")),
+            format!("mode: {:?}", policy.mode),
+            format!("保护路径: {} 条", policy.protect.paths.len()),
+            format!("签名规则: {} 条", policy.signatures.len()),
+            format!(
+                "二审后端: {}",
+                if policy.reviewers.is_empty() {
+                    "无(所有需二审的操作将 fail-closed 拒绝)".to_string()
+                } else {
+                    policy
+                        .reviewers
+                        .iter()
+                        .map(|r| format!("{}(as {})", r.name, r.run_as))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            ),
+            format!(
+                "隔离区: {} 保留 {} 天",
+                if policy.quarantine.enabled { "开" } else { "关" },
+                policy.quarantine.keep_days
+            ),
+            format!("隔离区位置: {}", quarantine::quarantine_root(&home).display()),
+        ]),
+        ControlRequest::QuarantineList { stamp: None } => {
+            let root = quarantine::quarantine_root(&home);
+            let mut batches: Vec<String> = std::fs::read_dir(&root)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().to_str().map(String::from))
+                .collect();
+            batches.sort();
+            if batches.is_empty() {
+                ControlResponse::ok(vec!["(隔离区为空)".into()])
+            } else {
+                ControlResponse::ok(batches)
+            }
+        }
+        ControlRequest::QuarantineList { stamp: Some(stamp) } => {
+            match quarantine::list_batch(&home, &stamp) {
+                Ok(items) if items.is_empty() => {
+                    ControlResponse::err(format!("批次 {stamp} 不存在或为空"))
+                }
+                Ok(items) => ControlResponse::ok(
+                    items.iter().map(|p| p.display().to_string()).collect(),
+                ),
+                Err(e) => ControlResponse::err(format!("{e}")),
+            }
+        }
+        ControlRequest::QuarantineRestore { stamp, path } => {
+            let target = PathBuf::from(&path);
+            if !target.is_absolute() {
+                return ControlResponse::err("恢复目标必须是绝对路径");
+            }
+            match quarantine::restore(&home, &stamp, &target) {
+                Ok(()) => ControlResponse::ok(vec![format!("已恢复 {path}")]),
+                Err(e) => ControlResponse::err(format!("{e}")),
+            }
+        }
+    }
 }

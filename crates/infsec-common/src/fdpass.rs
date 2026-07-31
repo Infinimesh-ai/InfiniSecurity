@@ -49,8 +49,18 @@ pub fn send_with_fd(sock: RawFd, payload: &[u8], fd: RawFd) -> Result<()> {
     Ok(())
 }
 
-/// 接收一条携带 fd 的消息,返回(载荷, fd)。fd 带 CLOEXEC。
+/// 接收一条携带 fd 的消息。没带 fd 时报错。
 pub fn recv_with_fd(sock: RawFd) -> Result<(Vec<u8>, OwnedFd)> {
+    let (payload, fd) = recv_maybe_fd(sock)?;
+    match fd {
+        Some(fd) => Ok((payload, fd)),
+        None => bail!("消息不含 SCM_RIGHTS 控制数据"),
+    }
+}
+
+/// 接收一条消息,fd 可有可无。
+/// daemon 用它区分两种连接:带 fd 的是监督会话,不带的是控制命令。
+pub fn recv_maybe_fd(sock: RawFd) -> Result<(Vec<u8>, Option<OwnedFd>)> {
     let mut payload = vec![0u8; MAX_PAYLOAD];
     let mut iov = libc::iovec {
         iov_base: payload.as_mut_ptr() as *mut libc::c_void,
@@ -80,7 +90,7 @@ pub fn recv_with_fd(sock: RawFd) -> Result<(Vec<u8>, OwnedFd)> {
             || (*cmsg).cmsg_level != libc::SOL_SOCKET
             || (*cmsg).cmsg_type != libc::SCM_RIGHTS
         {
-            bail!("消息不含 SCM_RIGHTS 控制数据");
+            return Ok((payload, None));
         }
         let mut fd: RawFd = -1;
         std::ptr::copy_nonoverlapping(
@@ -91,7 +101,7 @@ pub fn recv_with_fd(sock: RawFd) -> Result<(Vec<u8>, OwnedFd)> {
         if fd < 0 {
             bail!("收到非法 fd");
         }
-        Ok((payload, OwnedFd::from_raw_fd(fd)))
+        Ok((payload, Some(OwnedFd::from_raw_fd(fd))))
     }
 }
 
@@ -108,6 +118,12 @@ pub fn recv_with_fd_stream(
     stream: &std::os::unix::net::UnixStream,
 ) -> Result<(Vec<u8>, OwnedFd)> {
     recv_with_fd(stream.as_raw_fd())
+}
+
+pub fn recv_maybe_fd_stream(
+    stream: &std::os::unix::net::UnixStream,
+) -> Result<(Vec<u8>, Option<OwnedFd>)> {
+    recv_maybe_fd(stream.as_raw_fd())
 }
 
 #[cfg(test)]

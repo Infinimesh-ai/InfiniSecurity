@@ -12,10 +12,13 @@
 
 use anyhow::{bail, Context, Result};
 use infsec_common::fdpass;
-use infsec_common::protocol::{SessionAck, SessionHello, DEFAULT_SOCKET_PATH, PROTOCOL_VERSION};
+use infsec_common::protocol::{
+    ControlRequest, ControlResponse, SessionAck, SessionHello, DEFAULT_SOCKET_PATH,
+    PROTOCOL_VERSION,
+};
 use infsec_common::seccomp;
 use std::ffi::CString;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 
@@ -31,15 +34,79 @@ fn main() {
 
 fn usage() -> ! {
     eprintln!("用法:");
-    eprintln!("  infsec run [--socket S] [--intent TEXT] [--profile NAME] -- <cmd> [args...]");
+    eprintln!("  infsec run [--socket S] [--intent TEXT] [--profile NAME]");
+    eprintln!("             [--may-delete GLOB]... -- <cmd> [args...]");
+    eprintln!("  infsec status");
+    eprintln!("  infsec quarantine list [批次]");
+    eprintln!("  infsec quarantine restore <批次> <绝对路径>");
     eprintln!("  infsec version");
+    eprintln!();
+    eprintln!("  --profile   interactive | autonomous | ci | server");
+    eprintln!("              不给则自动判定(无 TTY / CI 环境变量),认不出取最严");
+    eprintln!("  --may-delete 预授权可删路径(可多次),如 'dist/**';");
+    eprintln!("              清单内免二审,越界按 T2/T3 处理并入审计");
     std::process::exit(2);
+}
+
+/// 走控制通道发一条命令并打印结果。
+/// 与监督会话共用同一个 socket:daemon 按"有没有带 fd"区分两者。
+fn control(req: ControlRequest) -> Result<()> {
+    let socket = std::env::var("INFSEC_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.into());
+    let mut stream = UnixStream::connect(&socket)
+        .with_context(|| format!("无法连接 infinisecd({socket})"))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    let line = format!("{}\n", serde_json::to_string(&req)?);
+    stream.write_all(line.as_bytes())?;
+
+    let mut reader = BufReader::new(stream);
+    let mut resp_line = String::new();
+    reader.read_line(&mut resp_line).context("读取响应失败")?;
+    let resp: ControlResponse = serde_json::from_str(resp_line.trim()).context("响应解析失败")?;
+    if !resp.ok {
+        bail!("{}", resp.error.unwrap_or_else(|| "未知错误".into()));
+    }
+    for l in resp.lines {
+        println!("{l}");
+    }
+    std::process::exit(0);
+}
+
+/// 自动判定情景(PLAN 2.4.3:"有无 TTY、是否 CI 环境变量")。
+/// 认不准就取更严的那个——情景判错的代价不对称。
+fn detect_profile() -> String {
+    let ci_vars = ["CI", "GITHUB_ACTIONS", "GITLAB_CI", "JENKINS_URL", "BUILDKITE"];
+    if ci_vars.iter().any(|v| std::env::var_os(v).is_some()) {
+        return "ci".to_string();
+    }
+    let has_tty = unsafe { libc::isatty(0) == 1 };
+    if has_tty {
+        "interactive".to_string()
+    } else {
+        // 没有终端 = 没人在场看着
+        "autonomous".to_string()
+    }
 }
 
 fn real_main() -> Result<()> {
     let argv: Vec<String> = std::env::args().collect();
     match argv.get(1).map(String::as_str) {
         Some("run") => {}
+        Some("status") => return control(ControlRequest::Status),
+        Some("quarantine") => {
+            return match argv.get(2).map(String::as_str) {
+                Some("list") => control(ControlRequest::QuarantineList {
+                    stamp: argv.get(3).cloned(),
+                }),
+                Some("restore") => match (argv.get(3), argv.get(4)) {
+                    (Some(stamp), Some(path)) => control(ControlRequest::QuarantineRestore {
+                        stamp: stamp.clone(),
+                        path: path.clone(),
+                    }),
+                    _ => usage(),
+                },
+                _ => usage(),
+            }
+        }
         Some("version") | Some("--version") => {
             println!("infsec {}", env!("CARGO_PKG_VERSION"));
             std::process::exit(0);
@@ -49,7 +116,8 @@ fn real_main() -> Result<()> {
 
     let mut socket = std::env::var("INFSEC_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.into());
     let mut intent: Option<String> = None;
-    let mut profile = "interactive".to_string();
+    let mut profile = detect_profile();
+    let mut may_delete: Vec<String> = Vec::new();
     let mut cmd: Vec<String> = Vec::new();
 
     let mut it = argv.iter().skip(2);
@@ -58,6 +126,9 @@ fn real_main() -> Result<()> {
             "--socket" => socket = it.next().map(String::clone).unwrap_or_else(|| usage()),
             "--intent" => intent = Some(it.next().map(String::clone).unwrap_or_else(|| usage())),
             "--profile" => profile = it.next().map(String::clone).unwrap_or_else(|| usage()),
+            "--may-delete" => {
+                may_delete.push(it.next().map(String::clone).unwrap_or_else(|| usage()))
+            }
             "--" => {
                 cmd = it.map(String::clone).collect();
                 break;
@@ -92,6 +163,7 @@ fn real_main() -> Result<()> {
         argv: cmd.clone(),
         intent,
         profile,
+        may_delete,
     };
     let hello_line = format!("{}\n", serde_json::to_string(&hello)?);
 

@@ -119,9 +119,15 @@ fn chroot_view(pid: i32, path: &Path) -> PathBuf {
 /// 判决之间二选一。也不能抽样比对某条路径:PrivateTmp 只分叉 `/tmp`,
 /// 拿 cwd(通常在 home)去比对什么也发现不了。
 ///
-/// 正确的判据是**按路径比对挂载来源**:目标路径落在哪个挂载点上,
-/// 两边的 (设备号, 挂载根) 是否相同。只读重挂(ProtectSystem)设备与
-/// 挂载根都不变,判为一致;私有 tmpfs 设备号不同,必被抓出。
+/// 正确的判据是把路径换算成**它在文件系统里的源位置**再比:
+/// `源 = 挂载根 + (路径 - 挂载点)`,然后比较两边的 (设备号, 源路径)。
+/// 也就是问一个更本质的问题:两边解析到的是不是同一个底层文件。
+///
+/// 直接比"挂载项相同"是不够的(第三次尝试才修对):`ProtectSystem=strict`
+/// 会给 daemon 造一个 `8:2 /home → /home` 的只读 bind mount,而宿主是
+/// `8:2 / → /`;挂载项不同,指向的却是同一批文件,按挂载项比会把正常
+/// 部署整个判成分叉。换算成源位置后两边都是 (8:2, /home/test/x),一致;
+/// 而 PrivateTmp 的私有 tmpfs 设备号本就不同,照样被抓出。
 #[derive(Debug, Clone)]
 pub struct MountView {
     /// 按挂载点长度降序,便于取最长前缀匹配。
@@ -179,11 +185,20 @@ impl MountView {
     }
 }
 
-/// daemon 与被监督进程在这条路径上看到的是不是同一个文件系统对象。
+impl MountView {
+    /// 路径在文件系统内的源位置:(设备号, 源路径)。
+    fn source_of(&self, path: &Path) -> Option<(String, PathBuf)> {
+        let e = self.covering(path)?;
+        let rel = path.strip_prefix(&e.mount_point).ok()?;
+        Some((e.dev.clone(), e.root.join(rel)))
+    }
+}
+
+/// daemon 与被监督进程在这条路径上看到的是不是同一个底层文件。
 /// 任何判不出来的情况都返回 false(fail-closed)。
 pub fn same_mount_source(daemon: &MountView, tracee: &MountView, path: &Path) -> bool {
-    match (daemon.covering(path), tracee.covering(path)) {
-        (Some(a), Some(b)) => a.dev == b.dev && a.root == b.root,
+    match (daemon.source_of(path), tracee.source_of(path)) {
+        (Some(a), Some(b)) => a == b,
         _ => false,
     }
 }
@@ -407,28 +422,52 @@ mod tests {
         assert_eq!(v.covering(Path::new("/tmp/x")).unwrap().dev, "0:99");
     }
 
-    /// 核心回归:PrivateTmp 式分叉必须判为不一致,只读重挂不算分叉。
+    /// 核心回归:真分叉要抓出来,systemd 的加固 bind mount 不算分叉。
     #[test]
-    fn divergence_detected_readonly_remount_is_not() {
+    fn divergence_detected_hardening_bind_mounts_are_not() {
+        // 宿主:单一根挂载
         let host = MountView::parse(
             "28 1 8:2 / / rw shared:1 - ext4 /dev/sda2 rw\n\
-             40 28 0:38 / /tmp rw shared:21 - tmpfs tmpfs rw\n\
-             50 28 8:2 /usr /usr rw shared:5 - ext4 /dev/sda2 rw",
+             40 28 0:38 / /tmp rw shared:21 - tmpfs tmpfs rw",
         );
+        // daemon:ProtectSystem=strict 造出 /home 与 /usr 的只读 bind mount,
+        // PrivateTmp 造出私有 /tmp。前两者不是分叉,后者是。
         let hardened = MountView::parse(
-            "28 1 8:2 / / rw shared:1 - ext4 /dev/sda2 rw\n\
+            "28 1 8:2 / / ro shared:1 - ext4 /dev/sda2 ro\n\
              40 28 0:77 / /tmp rw shared:21 - tmpfs private rw\n\
-             50 28 8:2 /usr /usr ro shared:5 - ext4 /dev/sda2 ro",
+             50 28 8:2 /home /home ro shared:5 - ext4 /dev/sda2 ro\n\
+             51 28 8:2 /usr /usr ro shared:6 - ext4 /dev/sda2 ro",
         );
         assert!(
             !same_mount_source(&hardened, &host, Path::new("/tmp/fixture/f.txt")),
             "私有 /tmp 必须判为分叉"
         );
         assert!(
-            same_mount_source(&hardened, &host, Path::new("/usr/bin/rm")),
-            "只读重挂设备与挂载根都没变,不算分叉"
+            same_mount_source(&hardened, &host, Path::new("/home/test/proj/a.rs")),
+            "ProtectSystem 的 /home bind mount 指向同一批文件,不是分叉"
         );
-        assert!(same_mount_source(&hardened, &host, Path::new("/home/u/x")));
+        assert!(
+            same_mount_source(&hardened, &host, Path::new("/usr/bin/rm")),
+            "只读重挂不是分叉"
+        );
+        assert!(same_mount_source(&hardened, &host, Path::new("/srv/x")));
+    }
+
+    /// 换算出的源位置必须是"文件在其文件系统内的路径"。
+    #[test]
+    fn source_of_maps_through_bind_mounts() {
+        let v = MountView::parse(
+            "28 1 8:2 / / rw shared:1 - ext4 /dev/sda2 rw\n\
+             41 28 8:2 /var/lib/x /srv/bound rw shared:2 - ext4 /dev/sda2 rw",
+        );
+        assert_eq!(
+            v.source_of(Path::new("/srv/bound/f.txt")).unwrap(),
+            ("8:2".to_string(), PathBuf::from("/var/lib/x/f.txt"))
+        );
+        assert_eq!(
+            v.source_of(Path::new("/home/u/a")).unwrap(),
+            ("8:2".to_string(), PathBuf::from("/home/u/a"))
+        );
     }
 
     /// 回归(M1 验收首轮漏判):存在性检查必须走被监督进程的命名空间。

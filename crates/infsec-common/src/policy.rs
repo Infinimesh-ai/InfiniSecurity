@@ -8,6 +8,7 @@ use serde::Deserialize;
 use std::path::Path;
 
 use crate::signature::SignatureRule;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -27,6 +28,107 @@ pub struct Policy {
     pub protect: Protect,
     #[serde(default, rename = "signature")]
     pub signatures: Vec<SignatureRule>,
+    /// M2:风险分级与二审。缺省时用出厂默认值。
+    #[serde(default)]
+    pub risk: Risk,
+    #[serde(default)]
+    pub quarantine: Quarantine,
+    #[serde(default, rename = "reviewer")]
+    pub reviewers: Vec<ReviewerConfig>,
+}
+
+/// 风险分级参数(PLAN 2.4)。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Risk {
+    /// T1 阈值:未推提交数上限。
+    #[serde(default = "d_max_ahead")]
+    pub t1_max_ahead: u32,
+    /// T1 阈值:最后一次提交距今上限(秒)。
+    #[serde(default = "d_max_push_age")]
+    pub t1_max_push_age_secs: u64,
+    /// 二审置信度阈值,低于此值的 allow 按 deny 处理。
+    #[serde(default = "d_min_conf")]
+    pub min_confidence: f64,
+    /// 单 Agent 二审超时(秒),超时 = deny。
+    #[serde(default = "d_review_timeout")]
+    pub review_timeout_secs: u64,
+    /// T3 会签超时(秒)。
+    #[serde(default = "d_cosign_timeout")]
+    pub cosign_timeout_secs: u64,
+    /// 判决缓存 TTL(秒)。
+    #[serde(default = "d_grant_ttl")]
+    pub grant_ttl_secs: u64,
+    /// 判决缓存文件数配额。
+    #[serde(default = "d_grant_files")]
+    pub grant_max_files: u32,
+    /// 判决缓存字节配额。
+    #[serde(default = "d_grant_bytes")]
+    pub grant_max_bytes: u64,
+}
+
+fn d_max_ahead() -> u32 { 5 }
+fn d_max_push_age() -> u64 { 24 * 3600 }
+fn d_min_conf() -> f64 { 0.8 }
+fn d_review_timeout() -> u64 { 15 }
+fn d_cosign_timeout() -> u64 { 30 }
+fn d_grant_ttl() -> u64 { 600 }
+fn d_grant_files() -> u32 { 500 }
+fn d_grant_bytes() -> u64 { 1024 * 1024 * 1024 }
+
+impl Default for Risk {
+    fn default() -> Self {
+        Risk {
+            t1_max_ahead: d_max_ahead(),
+            t1_max_push_age_secs: d_max_push_age(),
+            min_confidence: d_min_conf(),
+            review_timeout_secs: d_review_timeout(),
+            cosign_timeout_secs: d_cosign_timeout(),
+            grant_ttl_secs: d_grant_ttl(),
+            grant_max_files: d_grant_files(),
+            grant_max_bytes: d_grant_bytes(),
+        }
+    }
+}
+
+impl Risk {
+    pub fn review_timeout(&self) -> Duration { Duration::from_secs(self.review_timeout_secs) }
+    pub fn cosign_timeout(&self) -> Duration { Duration::from_secs(self.cosign_timeout_secs) }
+    pub fn grant_ttl(&self) -> Duration { Duration::from_secs(self.grant_ttl_secs) }
+    pub fn t1_max_push_age(&self) -> Duration { Duration::from_secs(self.t1_max_push_age_secs) }
+}
+
+/// 隔离区配置(PLAN 3.1)。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Quarantine {
+    /// 放行的删除是否进隔离区。关掉它等于放弃"错了能恢复"这个前提,
+    /// 所以默认开,且关闭时 daemon 会在启动时告警。
+    #[serde(default = "d_true")]
+    pub enabled: bool,
+    /// 保留天数,过期后真删。
+    #[serde(default = "d_keep_days")]
+    pub keep_days: u64,
+}
+
+fn d_true() -> bool { true }
+fn d_keep_days() -> u64 { 7 }
+
+impl Default for Quarantine {
+    fn default() -> Self {
+        Quarantine { enabled: true, keep_days: d_keep_days() }
+    }
+}
+
+/// 二审后端配置(PLAN 2.3 / 5.0)。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewerConfig {
+    pub name: String,
+    /// 命令与固定参数;证据包从 stdin 送入。
+    pub argv: Vec<String>,
+    /// 以哪个非特权用户运行。**必填**:LLM 绝不跑 root(PLAN 5.0)。
+    pub run_as: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +160,20 @@ impl Policy {
     pub fn validate(&self) -> Result<()> {
         if self.audit_log.is_empty() {
             bail!("audit_log 不能为空");
+        }
+        if !(0.0..=1.0).contains(&self.risk.min_confidence) {
+            bail!("min_confidence 必须在 0..=1 之间");
+        }
+        for r in &self.reviewers {
+            if r.argv.is_empty() {
+                bail!("二审后端 {} 缺少 argv", r.name);
+            }
+            if r.run_as.is_empty() || r.run_as == "root" {
+                bail!(
+                    "二审后端 {} 的 run_as 非法:LLM 进程绝不能跑 root(PLAN 5.0)",
+                    r.name
+                );
+            }
         }
         for rule in &self.signatures {
             rule.validate()?;
