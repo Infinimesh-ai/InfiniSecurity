@@ -21,7 +21,7 @@ use infsec_common::policy::{Mode, Policy};
 use infsec_common::protocol::{SessionAck, SessionHello, DEFAULT_SOCKET_PATH};
 use infsec_common::seccomp::{self, RecvResult, SeccompNotif};
 use infsec_common::Verdict;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -173,6 +173,20 @@ struct Session {
     protected: ProtectedSet,
     policy: Arc<Policy>,
     audit: Arc<AuditLog>,
+    /// daemon 与被监督进程各自的挂载表。判决每条路径前都要用它们确认
+    /// "我看到的就是它要动的那个文件";确认不了就拒
+    /// (见 tracee::MountView 的注释)。None = 读不到挂载表,全拒。
+    mounts: Option<(tracee::MountView, tracee::MountView)>,
+}
+
+impl Session {
+    /// 这条路径上,daemon 与被监督进程看到的是不是同一个文件系统对象。
+    fn view_ok(&self, path: &Path) -> bool {
+        match &self.mounts {
+            Some((daemon, tracee)) => tracee::same_mount_source(daemon, tracee, path),
+            None => false,
+        }
+    }
 }
 
 fn handle_session(
@@ -184,12 +198,11 @@ fn handle_session(
     stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
     let (uid, peer_pid) = peer_cred(&stream)?;
 
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
-    reader.read_line(&mut line).context("读取 hello 失败")?;
-    let hello: SessionHello = serde_json::from_str(line.trim()).context("hello 解析失败")?;
-
-    let notify_fd: OwnedFd = fdpass::recv_fd_stream(&stream).context("接收 notify fd 失败")?;
+    // hello 与 notify fd 在同一条消息里(见 protocol.rs:分两次读会丢 fd)。
+    let (payload, notify_fd): (Vec<u8>, OwnedFd) =
+        fdpass::recv_with_fd_stream(&stream).context("接收 hello + notify fd 失败")?;
+    let hello: SessionHello =
+        serde_json::from_slice(payload.trim_ascii_end()).context("hello 解析失败")?;
 
     let sid = format!(
         "s{}-{}",
@@ -206,12 +219,32 @@ fn handle_session(
     };
     writeln!(stream, "{}", serde_json::to_string(&ack)?)?;
 
+    // 视图一致性:判决层能否成立的前提,必须在放行任何 syscall 之前备好。
+    let mounts = match (
+        tracee::MountView::read(-1),
+        tracee::MountView::read(peer_pid),
+    ) {
+        (Ok(d), Ok(t)) if !tracee::is_chrooted(peer_pid) => Some((d, t)),
+        (Ok(_), Ok(_)) => {
+            eprintln!(
+                "infinisecd: ⚠ 会话 {sid}:被监督进程(pid {peer_pid})运行在 chroot 里,\
+                 daemon 对绝对路径的解释不再成立,本会话路径类 syscall 全拒。"
+            );
+            None
+        }
+        _ => {
+            eprintln!("infinisecd: ⚠ 会话 {sid}:读不到挂载表,本会话路径类 syscall 全拒。");
+            None
+        }
+    };
+
     let session = Session {
         id: sid,
         uid,
         protected,
         policy,
         audit,
+        mounts,
     };
 
     session.audit.write(&AuditRecord {
@@ -226,10 +259,11 @@ fn handle_session(
         verdict: "-",
         rule: None,
         note: Some(&format!(
-            "profile={} cwd={} intent={}",
+            "profile={} cwd={} intent={} view_ok={}",
             hello.profile,
             hello.cwd,
-            hello.intent.as_deref().unwrap_or("-")
+            hello.intent.as_deref().unwrap_or("-"),
+            session.mounts.is_some()
         )),
     });
 
@@ -330,6 +364,24 @@ fn decide_and_respond(session: &Session, fd: i32, notif: &SeccompNotif) {
         }
     };
 
+    // 涉及的任一路径上视图不一致 → 该路径的判决不可信,直接拒。
+    // exec 不受影响:签名匹配的是 argv,与文件系统视图无关。
+    let path_view_bad = !matches!(event, verdict::Event::Exec { .. })
+        && event_paths(&event).any(|p| !session.view_ok(p));
+    if path_view_bad {
+        let _ = seccomp::notif_send(fd, &seccomp::resp_deny_eperm(notif.id));
+        audit_syscall(
+            session,
+            notif,
+            argv.as_deref(),
+            &paths,
+            "deny",
+            Some("view-divergence-fail-closed"),
+            Some("daemon 与被监督进程文件系统视图不一致,路径判决不可信"),
+        );
+        return;
+    }
+
     let core = verdict::VerdictCore {
         protected: &session.protected,
         signatures: &session.policy.signatures,
@@ -384,7 +436,6 @@ fn parse_event(
     let a = &notif.data.args;
     let nr = notif.data.nr as u32;
 
-    let path_str = |p: &Path| p.display().to_string();
 
     match nr {
         NR_EXECVE | NR_EXECVEAT => {
@@ -401,7 +452,7 @@ fn parse_event(
             let exe_resolved = tracee::resolve_path(pid, dirfd, &filename)?;
             let cwd = tracee::proc_readlink(pid, "cwd")?;
             let resolved_args = verdict::resolve_argv_paths(&argv, &cwd);
-            let paths = vec![path_str(&exe_resolved)];
+            let paths = exe_resolved.to_audit_strings();
             Ok((
                 verdict::Event::Exec { argv: argv.clone(), resolved_args },
                 Some(argv),
@@ -411,57 +462,79 @@ fn parse_event(
         NR_UNLINK | NR_RMDIR => {
             let raw = tracee::read_cstr(pid, a[0])?;
             let path = tracee::resolve_path(pid, libc::AT_FDCWD, &raw)?;
-            let ps = vec![path_str(&path)];
+            let ps = path.to_audit_strings();
             Ok((verdict::Event::Remove { path }, None, ps))
         }
         NR_UNLINKAT => {
             let raw = tracee::read_cstr(pid, a[1])?;
             let path = tracee::resolve_path(pid, a[0] as i32, &raw)?;
-            let ps = vec![path_str(&path)];
+            let ps = path.to_audit_strings();
             Ok((verdict::Event::Remove { path }, None, ps))
         }
         NR_RENAME => {
             let from = tracee::resolve_path(pid, libc::AT_FDCWD, &tracee::read_cstr(pid, a[0])?)?;
             let to = tracee::resolve_path(pid, libc::AT_FDCWD, &tracee::read_cstr(pid, a[1])?)?;
-            let to_exists = to.symlink_metadata().is_ok();
-            let ps = vec![path_str(&from), path_str(&to)];
+            let to_exists = exists_any(pid, &to);
+            let mut ps = from.to_audit_strings();
+            ps.extend(to.to_audit_strings());
             Ok((verdict::Event::Rename { from, to, to_exists }, None, ps))
         }
         NR_RENAMEAT | NR_RENAMEAT2 => {
             let from = tracee::resolve_path(pid, a[0] as i32, &tracee::read_cstr(pid, a[1])?)?;
             let to = tracee::resolve_path(pid, a[2] as i32, &tracee::read_cstr(pid, a[3])?)?;
-            let to_exists = to.symlink_metadata().is_ok();
-            let ps = vec![path_str(&from), path_str(&to)];
+            let to_exists = exists_any(pid, &to);
+            let mut ps = from.to_audit_strings();
+            ps.extend(to.to_audit_strings());
             Ok((verdict::Event::Rename { from, to, to_exists }, None, ps))
         }
         NR_TRUNCATE => {
             let path = tracee::resolve_path(pid, libc::AT_FDCWD, &tracee::read_cstr(pid, a[0])?)?;
-            let exists = path.symlink_metadata().is_ok();
-            let ps = vec![path_str(&path)];
+            let exists = exists_any(pid, &path);
+            let ps = path.to_audit_strings();
             Ok((verdict::Event::Truncate { path, exists }, None, ps))
         }
         NR_FTRUNCATE => match tracee::resolve_fd(pid, a[0] as i32)? {
             Some(path) => {
-                let exists = path.symlink_metadata().is_ok();
-                let ps = vec![path_str(&path)];
-                Ok((verdict::Event::Truncate { path, exists }, None, ps))
+                // fd 已经指向具体 inode,截断的必然是既有内容。
+                let path = tracee::PathId::single(path);
+                let ps = path.to_audit_strings();
+                Ok((verdict::Event::Truncate { path, exists: true }, None, ps))
             }
             None => Ok((verdict::Event::TruncateNonPath, None, vec![])),
         },
         NR_OPEN | NR_CREAT => {
             let path = tracee::resolve_path(pid, libc::AT_FDCWD, &tracee::read_cstr(pid, a[0])?)?;
-            let exists = path.symlink_metadata().is_ok();
-            let ps = vec![path_str(&path)];
+            let exists = exists_any(pid, &path);
+            let ps = path.to_audit_strings();
             Ok((verdict::Event::Truncate { path, exists }, None, ps))
         }
         NR_OPENAT => {
             let path = tracee::resolve_path(pid, a[0] as i32, &tracee::read_cstr(pid, a[1])?)?;
-            let exists = path.symlink_metadata().is_ok();
-            let ps = vec![path_str(&path)];
+            let exists = exists_any(pid, &path);
+            let ps = path.to_audit_strings();
             Ok((verdict::Event::Truncate { path, exists }, None, ps))
         }
         other => bail!("过滤器送来了未预期的 syscall {other}"),
     }
+}
+
+/// 事件涉及的全部路径身份(视图一致性要逐条确认)。
+fn event_paths(ev: &verdict::Event) -> Box<dyn Iterator<Item = &Path> + '_> {
+    match ev {
+        verdict::Event::Exec { .. } | verdict::Event::TruncateNonPath => {
+            Box::new(std::iter::empty())
+        }
+        verdict::Event::Remove { path } | verdict::Event::Truncate { path, .. } => {
+            Box::new(path.all())
+        }
+        verdict::Event::Rename { from, to, .. } => Box::new(from.all().chain(to.all())),
+    }
+}
+
+/// 路径的任一身份存在即算存在。存在性只用于区分"截断既有内容"和
+/// "新建文件",判不出来时 exists_in_ns 返回 true(fail-closed)。
+fn exists_any(pid: i32, id: &tracee::PathId) -> bool {
+    id.all().any(|p| tracee::exists_in_ns(pid, p))
 }
 
 fn audit_syscall(

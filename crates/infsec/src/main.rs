@@ -15,7 +15,7 @@ use infsec_common::fdpass;
 use infsec_common::protocol::{SessionAck, SessionHello, DEFAULT_SOCKET_PATH, PROTOCOL_VERSION};
 use infsec_common::seccomp;
 use std::ffi::CString;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 
@@ -82,7 +82,7 @@ fn real_main() -> Result<()> {
     })?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
 
-    // 2. hello
+    // 2. 准备 hello(与 notify fd 在同一条消息里发出,见 protocol.rs)
     let hello = SessionHello {
         version: PROTOCOL_VERSION,
         pid: std::process::id() as i32,
@@ -93,14 +93,14 @@ fn real_main() -> Result<()> {
         intent,
         profile,
     };
-    writeln!(stream, "{}", serde_json::to_string(&hello)?)?;
+    let hello_line = format!("{}\n", serde_json::to_string(&hello)?);
 
     // 3. 装 filter(此刻起本进程已在拦截集内)并拿 notify fd
     let notify_fd = seccomp::install_filter_with_listener()
         .context("安装 seccomp filter 失败")?;
 
-    // 4. 移交 notify fd
-    fdpass::send_fd_stream(&stream, notify_fd.as_raw_fd())
+    // 4. 一条消息移交 hello + notify fd
+    fdpass::send_with_fd_stream(&stream, hello_line.as_bytes(), notify_fd.as_raw_fd())
         .context("移交 notify fd 失败;fail-closed,拒绝继续")?;
 
     // 5. 等 ack:确认 daemon 已接管监督,才允许 exec

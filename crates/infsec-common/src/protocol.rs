@@ -1,11 +1,15 @@
 //! 启动器 ↔ daemon 的 unix socket 协议。
 //!
 //! 一次会话 = 一条连接:
-//! 1. 启动器发一行 JSON hello(`SessionHello`),换行结尾;
-//! 2. 启动器 sendmsg 一个字节 'F' + SCM_RIGHTS 携带 seccomp notify fd;
-//! 3. daemon 回一行 `{"ok":true}`;
-//! 4. 连接保持打开;启动器 exec 后它就是被监督进程本体。
+//! 1. 启动器用**一条** sendmsg 发出 JSON hello(`SessionHello`,换行结尾)
+//!    作为载荷,并在同一条消息的 SCM_RIGHTS 里携带 seccomp notify fd;
+//! 2. daemon 一次 recvmsg 同时拿到两者,回一行 `{"ok":true}`;
+//! 3. 连接保持打开;启动器 exec 后它就是被监督进程本体。
 //!    daemon 从 SO_PEERCRED 取 uid——hello 里的字段是"声明",凭证是内核给的。
+//!
+//! 为什么必须合成一条:普通 `read()`(含 BufReader 的预读)会静默丢弃
+//! 随消息附带的 fd。分两条发就存在"hello 读取顺手吃掉 fd"的竞态,
+//! 表现为随机握手失败。
 //!
 //! fail-closed 契约:任何一步失败,启动器都必须拒绝继续 exec。
 

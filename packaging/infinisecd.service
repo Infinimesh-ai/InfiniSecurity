@@ -26,8 +26,15 @@ RuntimeDirectory=infinisec
 RuntimeDirectoryMode=0755
 LogsDirectory=infinisec
 StateDirectory=infinisec
+# 关于挂载命名空间:判决核必须与被监督进程看到**同一个文件系统视图**。
+# 任何给 daemon 造出私有挂载的加固项(PrivateTmp=、PrivateMounts=、
+# ProtectHome=yes/tmpfs、BindPaths= 等)都会让路径判决失去意义:
+# daemon 眼里那些文件全都"不存在",于是"截断已有文件"被当成"新建文件"
+# 放行——M1 验收里 PrivateTmp=yes 就是这样漏掉一次 O_TRUNC 的。
+# 现在 daemon 会在会话开始时自检视图一致性并整会话 fail-closed,
+# 但正确的部署本来就不该触发它。ProtectHome=read-only 只改权限、
+# 不换挂载视图,可以保留。
 ProtectHome=read-only
-PrivateTmp=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectKernelLogs=yes

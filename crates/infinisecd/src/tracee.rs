@@ -94,18 +94,212 @@ pub fn proc_readlink(pid: i32, what: &str) -> Result<PathBuf> {
     std::fs::read_link(&p).with_context(|| format!("readlink {p} 失败"))
 }
 
+/// 同一条路径经被监督进程的根目录看过去的写法(处理 chroot)。
+///
+/// 注意边界:`/proc/<pid>/root` 只跨得过 **chroot**,跨不过 mount
+/// namespace——M1 验收里证实过,daemon 带 `PrivateTmp=yes` 时,
+/// `/proc/<tracee>/root/tmp/...` 一律 ENOENT(遍历仍在 daemon 自己的
+/// 挂载表里进行)。所以它只是补充手段,视图一致性由 `view_consistent`
+/// 在会话开始时把关。
+fn chroot_view(pid: i32, path: &Path) -> PathBuf {
+    let rel = path.strip_prefix("/").unwrap_or(path);
+    PathBuf::from(format!("/proc/{pid}/root")).join(rel)
+}
+
+/// 一个进程的挂载表视图(`/proc/<pid>/mountinfo`)。
+///
+/// 存在的理由:daemon 对路径的每一个结论,前提都是"我看到的那个文件
+/// 就是被监督进程要动的那个文件"。这个前提会安静地不成立——daemon
+/// 若有私有挂载(systemd `PrivateTmp=`、容器),分叉子树里的 stat 全部
+/// 返回"不存在",于是"截断已有文件"被判成"新建文件"并放行。
+/// M1 验收里 `PrivateTmp=yes` 就是这样漏掉一次 O_TRUNC 的。
+///
+/// 判据不能是"两者必须在同一个 mount namespace":`ProtectSystem=strict`
+/// 这类加固项本身就会给 daemon 造一个 namespace,那样等于要在加固和
+/// 判决之间二选一。也不能抽样比对某条路径:PrivateTmp 只分叉 `/tmp`,
+/// 拿 cwd(通常在 home)去比对什么也发现不了。
+///
+/// 正确的判据是**按路径比对挂载来源**:目标路径落在哪个挂载点上,
+/// 两边的 (设备号, 挂载根) 是否相同。只读重挂(ProtectSystem)设备与
+/// 挂载根都不变,判为一致;私有 tmpfs 设备号不同,必被抓出。
+#[derive(Debug, Clone)]
+pub struct MountView {
+    /// 按挂载点长度降序,便于取最长前缀匹配。
+    entries: Vec<MountEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MountEntry {
+    mount_point: PathBuf,
+    /// major:minor
+    dev: String,
+    /// 该挂载在其文件系统内的根(bind mount 会是子目录)
+    root: PathBuf,
+}
+
+impl MountView {
+    pub fn read(pid: i32) -> Result<MountView> {
+        let path = if pid < 0 {
+            "/proc/self/mountinfo".to_string()
+        } else {
+            format!("/proc/{pid}/mountinfo")
+        };
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("读取 {path} 失败"))?;
+        Ok(MountView::parse(&text))
+    }
+
+    fn parse(text: &str) -> MountView {
+        let mut entries: Vec<MountEntry> = text
+            .lines()
+            .filter_map(|line| {
+                let f: Vec<&str> = line.split(' ').collect();
+                // id parent major:minor root mount_point options [optional...] - fstype source superopts
+                if f.len() < 5 {
+                    return None;
+                }
+                Some(MountEntry {
+                    dev: f[2].to_string(),
+                    root: PathBuf::from(unescape_octal(f[3])),
+                    mount_point: PathBuf::from(unescape_octal(f[4])),
+                })
+            })
+            .collect();
+        // 同一挂载点可被多次覆盖,后出现的生效;降序排序前先保持原顺序里的最后一个
+        entries.reverse();
+        entries.sort_by_key(|e| std::cmp::Reverse(e.mount_point.as_os_str().len()));
+        MountView { entries }
+    }
+
+    /// 覆盖 `path` 的那个挂载项(最长前缀匹配)。
+    fn covering(&self, path: &Path) -> Option<&MountEntry> {
+        self.entries
+            .iter()
+            .find(|e| path == e.mount_point || path.starts_with(&e.mount_point))
+    }
+}
+
+/// daemon 与被监督进程在这条路径上看到的是不是同一个文件系统对象。
+/// 任何判不出来的情况都返回 false(fail-closed)。
+pub fn same_mount_source(daemon: &MountView, tracee: &MountView, path: &Path) -> bool {
+    match (daemon.covering(path), tracee.covering(path)) {
+        (Some(a), Some(b)) => a.dev == b.dev && a.root == b.root,
+        _ => false,
+    }
+}
+
+/// 被监督进程是否被 chroot。是的话 daemon 对绝对路径的解释不再成立;
+/// M1 按分叉处理并告警——这条路径没有验收过,与其猜不如显式拒绝。
+pub fn is_chrooted(pid: i32) -> bool {
+    !matches!(proc_readlink(pid, "root"), Ok(r) if r == Path::new("/"))
+}
+
+/// mountinfo 用 \040 之类的八进制转义表示空格等字符。
+fn unescape_octal(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 3 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 4], 8) {
+                out.push(v as char);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// 路径在被监督进程视角下是否存在。
+///
+/// 两条视角都查(chroot 视图 + daemon 直接视图),**任一说存在就算存在**;
+/// 出现无法判断的错误也算存在。调用方用它区分"截断已有内容"与"新建文件",
+/// 判不准就按破坏性更强的解读走(fail-closed)。
+/// 前提是视图一致,由 `view_consistent` 在会话开始时保证。
+pub fn exists_in_ns(pid: i32, path: &Path) -> bool {
+    let judge = |p: PathBuf| match p.symlink_metadata() {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    };
+    judge(chroot_view(pid, path)) || judge(path.to_path_buf())
+}
+
+/// 在被监督进程的命名空间里解析符号链接。
+///
+/// 用 `O_PATH` 打开再读 `/proc/self/fd/<n>`:路径走查交给内核做,它能
+/// 正确穿过 `/proc/<pid>/root` 这个 magic link。realpath(3)/canonicalize
+/// 不行——它们自己 readlink,会把 `/proc/<pid>/root` 读成 `/`,一步退回
+/// daemon 的视角,正是要避免的那个错误。
+fn resolve_symlinks_in_ns(pid: i32, path: &Path) -> Option<PathBuf> {
+    open_path_and_readlink(&chroot_view(pid, path))
+        .or_else(|| open_path_and_readlink(path))
+}
+
+fn open_path_and_readlink(p: &Path) -> Option<PathBuf> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(p.as_os_str().as_bytes()).ok()?;
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    let link = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok();
+    unsafe { libc::close(fd) };
+    link
+}
+
+/// 一条路径的多重身份。
+///
+/// `lexical` 是纯词法解析的结果,`real` 是穿过符号链接后的结果。
+/// 攻击者可以用符号链接让两者分叉(cwd 里放一个指向保护区的链接),
+/// 所以**两者都要过保护集,任一命中即拒**。多判一次的代价是偶尔过严,
+/// 漏判一次的代价是保护区被删——方向不对称,选过严。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathId {
+    pub lexical: PathBuf,
+    pub real: Option<PathBuf>,
+}
+
+impl PathId {
+    pub fn new(lexical: PathBuf, real: Option<PathBuf>) -> PathId {
+        let real = real.filter(|r| *r != lexical);
+        PathId { lexical, real }
+    }
+
+    /// 仅用于单测与不涉及命名空间的场景。
+    pub fn single(p: PathBuf) -> PathId {
+        PathId { lexical: p, real: None }
+    }
+
+    /// 审计与人读展示用的路径。
+    pub fn shown(&self) -> &Path {
+        &self.lexical
+    }
+
+    /// 全部身份(至少一个)。
+    pub fn all(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(self.lexical.as_path()).chain(self.real.as_deref())
+    }
+
+    pub fn to_audit_strings(&self) -> Vec<String> {
+        self.all().map(|p| p.display().to_string()).collect()
+    }
+}
+
 /// 把 syscall 里的路径参数解析为规范化绝对路径。
 ///
 /// - 绝对路径:直接词法规范化;
 /// - 相对 + AT_FDCWD:基准取 /proc/<pid>/cwd;
 /// - 相对 + dirfd:基准取 /proc/<pid>/fd/<dirfd> 的链接目标。
 ///
-/// 然后对**父目录**做符号链接解析(std::fs::canonicalize),最后一个
-/// 分量保持原样——unlink/rename 作用于链接本身而不是链接目标,
-/// 解析最终分量会把"删一个符号链接"误判成"删它指向的保护文件",
-/// 反之更糟:把指向保护区的链接解析丢会漏判。父目录解析 + 末段原样
-/// 是与内核 unlink 语义一致的组合。
-pub fn resolve_path(pid: i32, dirfd: i32, raw: &str) -> Result<PathBuf> {
+/// 符号链接只解析**父目录**,最终分量保持原样——unlink/rename 作用于
+/// 链接本身而不是链接目标,解析最终分量会把"删一个符号链接"误判成
+/// "删它指向的保护文件"。父目录解析 + 末段原样与内核 unlink 语义一致。
+pub fn resolve_path(pid: i32, dirfd: i32, raw: &str) -> Result<PathId> {
     if raw.is_empty() {
         bail!("空路径");
     }
@@ -123,21 +317,14 @@ pub fn resolve_path(pid: i32, dirfd: i32, raw: &str) -> Result<PathBuf> {
         target
     };
     let lexical = lexical_resolve(&base, raw_path);
-    Ok(canonicalize_parent(&lexical))
+    Ok(PathId::new(lexical.clone(), resolved_parent(pid, &lexical)))
 }
 
-/// 解析父目录符号链接,保留最终分量。任何失败退回词法结果。
-fn canonicalize_parent(p: &Path) -> PathBuf {
-    let Some(parent) = p.parent() else {
-        return p.to_path_buf();
-    };
-    let Some(name) = p.file_name() else {
-        return p.to_path_buf();
-    };
-    match parent.canonicalize() {
-        Ok(real_parent) => real_parent.join(name),
-        Err(_) => p.to_path_buf(),
-    }
+/// 父目录经符号链接解析后 + 原最终分量。失败返回 None(退回纯词法)。
+fn resolved_parent(pid: i32, p: &Path) -> Option<PathBuf> {
+    let parent = p.parent()?;
+    let name = p.file_name()?;
+    Some(resolve_symlinks_in_ns(pid, parent)?.join(name))
 }
 
 /// ftruncate 一类按 fd 操作:解析 /proc/<pid>/fd/<fd>。
@@ -177,8 +364,109 @@ mod tests {
         let pid = std::process::id() as i32;
         let cwd = std::env::current_dir().unwrap();
         let r = resolve_path(pid, libc::AT_FDCWD, "some-file.txt").unwrap();
-        assert_eq!(r, cwd.join("some-file.txt"));
+        assert_eq!(r.lexical, cwd.join("some-file.txt"));
         let r = resolve_path(pid, libc::AT_FDCWD, "/tmp/../etc/hosts").unwrap();
-        assert_eq!(r, PathBuf::from("/etc/hosts"));
+        assert_eq!(r.lexical, PathBuf::from("/etc/hosts"));
+    }
+
+    /// 自身进程必然与自己同视图,且不在 chroot 里。
+    /// 跨命名空间的反向证据(PrivateTmp 下必须判为分叉)在 VM 验收里,
+    /// 记录于 docs/M1-ACCEPTANCE.md。
+    #[test]
+    fn mount_view_of_self_is_consistent() {
+        let pid = std::process::id() as i32;
+        let a = MountView::read(-1).unwrap();
+        let b = MountView::read(pid).unwrap();
+        assert!(!a.entries.is_empty(), "mountinfo 不该是空的");
+        for p in ["/", "/tmp", "/home", "/usr"] {
+            assert!(
+                same_mount_source(&a, &b, Path::new(p)),
+                "自身视角在 {p} 上必须一致"
+            );
+        }
+        assert!(!is_chrooted(pid));
+    }
+
+    #[test]
+    fn mount_view_parsing() {
+        // 真实 mountinfo 片段(含 bind mount 与只读重挂)
+        let text = "\
+23 28 0:22 / /proc rw,nosuid,relatime shared:12 - proc proc rw
+28 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw
+40 28 0:38 / /tmp rw,nosuid,nodev shared:21 - tmpfs tmpfs rw
+41 28 8:2 /var/lib/x /srv/bound rw,relatime shared:1 - ext4 /dev/sda2 rw
+42 28 0:99 / /tmp rw,nosuid shared:99 - tmpfs private-tmp rw";
+        let v = MountView::parse(text);
+        // 最长前缀匹配
+        assert_eq!(v.covering(Path::new("/home/u/a.txt")).unwrap().dev, "8:2");
+        assert_eq!(v.covering(Path::new("/proc/1/status")).unwrap().dev, "0:22");
+        // bind mount 的挂载根被保留
+        let b = v.covering(Path::new("/srv/bound/f")).unwrap();
+        assert_eq!(b.root, PathBuf::from("/var/lib/x"));
+        // 同一挂载点被覆盖时,后出现的那条生效(私有 tmpfs 盖住原 /tmp)
+        assert_eq!(v.covering(Path::new("/tmp/x")).unwrap().dev, "0:99");
+    }
+
+    /// 核心回归:PrivateTmp 式分叉必须判为不一致,只读重挂不算分叉。
+    #[test]
+    fn divergence_detected_readonly_remount_is_not() {
+        let host = MountView::parse(
+            "28 1 8:2 / / rw shared:1 - ext4 /dev/sda2 rw\n\
+             40 28 0:38 / /tmp rw shared:21 - tmpfs tmpfs rw\n\
+             50 28 8:2 /usr /usr rw shared:5 - ext4 /dev/sda2 rw",
+        );
+        let hardened = MountView::parse(
+            "28 1 8:2 / / rw shared:1 - ext4 /dev/sda2 rw\n\
+             40 28 0:77 / /tmp rw shared:21 - tmpfs private rw\n\
+             50 28 8:2 /usr /usr ro shared:5 - ext4 /dev/sda2 ro",
+        );
+        assert!(
+            !same_mount_source(&hardened, &host, Path::new("/tmp/fixture/f.txt")),
+            "私有 /tmp 必须判为分叉"
+        );
+        assert!(
+            same_mount_source(&hardened, &host, Path::new("/usr/bin/rm")),
+            "只读重挂设备与挂载根都没变,不算分叉"
+        );
+        assert!(same_mount_source(&hardened, &host, Path::new("/home/u/x")));
+    }
+
+    /// 回归(M1 验收首轮漏判):存在性检查必须走被监督进程的命名空间。
+    /// 这里用自身 pid 做同命名空间的正确性校验;跨命名空间的证据在
+    /// docs/M1-ACCEPTANCE.md 的 VM 验收记录里。
+    #[test]
+    fn existence_uses_tracee_namespace() {
+        let pid = std::process::id() as i32;
+        let dir = std::env::temp_dir().join(format!("infsec-ns-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("here.txt");
+        std::fs::write(&f, b"x").unwrap();
+        assert!(exists_in_ns(pid, &f), "已存在的文件必须判为存在");
+        assert!(!exists_in_ns(pid, &dir.join("absent.txt")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 符号链接分叉:词法路径与真实路径都要被保留下来供保护集匹配。
+    #[test]
+    fn symlink_divergence_keeps_both_identities() {
+        let pid = std::process::id() as i32;
+        let base = std::env::temp_dir().join(format!("infsec-link-{}", std::process::id()));
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let target = link.join("f.txt");
+        let id = resolve_path(pid, libc::AT_FDCWD, target.to_str().unwrap()).unwrap();
+        assert_eq!(id.lexical, target, "词法身份保留链接路径");
+        assert_eq!(
+            id.real.as_deref(),
+            Some(real.join("f.txt").as_path()),
+            "真实身份必须穿过符号链接"
+        );
+        // 两个身份都会被判决层拿去匹配保护集
+        assert_eq!(id.all().count(), 2);
+        std::fs::remove_dir_all(&base).ok();
     }
 }

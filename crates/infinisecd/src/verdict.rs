@@ -4,6 +4,7 @@
 //! 不做 IO、不读 /proc——所以能被完整单测。风险分级与二审是 M2,
 //! M1 语义:签名命中 → 拒;保护路径上的删除/移出/截断 → 一律拒。
 
+use crate::tracee::PathId;
 use infsec_common::paths::ProtectedSet;
 use infsec_common::signature::{match_signatures, SignatureRule};
 use infsec_common::Verdict;
@@ -18,11 +19,12 @@ pub enum Event {
     /// 的规则使用它)。
     Exec { argv: Vec<String>, resolved_args: Vec<PathBuf> },
     /// unlink/unlinkat/rmdir:删除目标。
-    Remove { path: PathBuf },
+    Remove { path: PathId },
     /// rename 族:源与目的。
-    Rename { from: PathBuf, to: PathBuf, to_exists: bool },
+    Rename { from: PathId, to: PathId, to_exists: bool },
     /// truncate / open(O_TRUNC) / creat:截断目标与其存在性。
-    Truncate { path: PathBuf, exists: bool },
+    /// `exists` 判不出来时必须传 true(fail-closed,见 tracee::exists_in_ns)。
+    Truncate { path: PathId, exists: bool },
     /// ftruncate 但 fd 不指向常规文件路径(pipe 等)。
     TruncateNonPath,
 }
@@ -33,22 +35,27 @@ pub struct VerdictCore<'a> {
 }
 
 impl VerdictCore<'_> {
+    /// 保护集匹配:路径的**任一**身份命中即算命中(见 PathId 的注释)。
+    fn hit(&self, id: &PathId) -> Option<String> {
+        id.all().find_map(|p| self.protected.hit(p))
+    }
+
     pub fn decide(&self, ev: &Event) -> Verdict {
         match ev {
             Event::Exec { argv, resolved_args } => self.decide_exec(argv, resolved_args),
-            Event::Remove { path } => match self.protected.hit(path) {
+            Event::Remove { path } => match self.hit(path) {
                 Some(rule) => Verdict::Deny { rule },
                 None => Verdict::Allow,
             },
             Event::Rename { from, to, to_exists } => {
                 // 源在保护区:移出 = 等价删除;区内改名同样可能覆盖别的
                 // 保护文件。M1 无二审通道,从严:一律拒。
-                if let Some(rule) = self.protected.hit(from) {
+                if let Some(rule) = self.hit(from) {
                     return Verdict::Deny { rule: format!("rename-from:{rule}") };
                 }
                 // 目的在保护区且已存在:rename 会原子覆盖它 = 内容销毁。
                 if *to_exists {
-                    if let Some(rule) = self.protected.hit(to) {
+                    if let Some(rule) = self.hit(to) {
                         return Verdict::Deny { rule: format!("rename-overwrite:{rule}") };
                     }
                 }
@@ -58,7 +65,7 @@ impl VerdictCore<'_> {
                 // 只有"已存在的保护文件被截断"是内容销毁;
                 // O_TRUNC 创建新文件是正常写入。
                 if *exists {
-                    if let Some(rule) = self.protected.hit(path) {
+                    if let Some(rule) = self.hit(path) {
                         return Verdict::Deny { rule: format!("truncate:{rule}") };
                     }
                 }
@@ -172,15 +179,15 @@ mod tests {
         let (pset, sigs) = core_fixture();
         let core = VerdictCore { protected: &pset, signatures: &sigs };
         let deny = core.decide(&Event::Remove {
-            path: PathBuf::from("/home/u/Documents/proj/main.go"),
+            path: PathId::single(PathBuf::from("/home/u/Documents/proj/main.go")),
         });
         assert!(deny.is_deny());
         let deny = core.decide(&Event::Remove {
-            path: PathBuf::from("/tmp/repo/.git/HEAD"),
+            path: PathId::single(PathBuf::from("/tmp/repo/.git/HEAD")),
         });
         assert!(deny.is_deny(), ".git 内容受保护");
         let allow = core.decide(&Event::Remove {
-            path: PathBuf::from("/tmp/scratch/file.txt"),
+            path: PathId::single(PathBuf::from("/tmp/scratch/file.txt")),
         });
         assert_eq!(allow, Verdict::Allow);
     }
@@ -192,24 +199,24 @@ mod tests {
         // 移出保护区 = 等价删除
         assert!(core
             .decide(&Event::Rename {
-                from: PathBuf::from("/home/u/Documents/proj/a.rs"),
-                to: PathBuf::from("/tmp/a.rs"),
+                from: PathId::single(PathBuf::from("/home/u/Documents/proj/a.rs")),
+                to: PathId::single(PathBuf::from("/tmp/a.rs")),
                 to_exists: false,
             })
             .is_deny());
         // 覆盖保护区已有文件
         assert!(core
             .decide(&Event::Rename {
-                from: PathBuf::from("/tmp/new.rs"),
-                to: PathBuf::from("/home/u/Documents/proj/a.rs"),
+                from: PathId::single(PathBuf::from("/tmp/new.rs")),
+                to: PathId::single(PathBuf::from("/home/u/Documents/proj/a.rs")),
                 to_exists: true,
             })
             .is_deny());
         // 移入保护区新路径:放行
         assert_eq!(
             core.decide(&Event::Rename {
-                from: PathBuf::from("/tmp/new.rs"),
-                to: PathBuf::from("/home/u/Documents/proj/new.rs"),
+                from: PathId::single(PathBuf::from("/tmp/new.rs")),
+                to: PathId::single(PathBuf::from("/home/u/Documents/proj/new.rs")),
                 to_exists: false,
             }),
             Verdict::Allow
@@ -217,8 +224,8 @@ mod tests {
         // 保护区外互移:放行
         assert_eq!(
             core.decide(&Event::Rename {
-                from: PathBuf::from("/tmp/a"),
-                to: PathBuf::from("/tmp/b"),
+                from: PathId::single(PathBuf::from("/tmp/a")),
+                to: PathId::single(PathBuf::from("/tmp/b")),
                 to_exists: false,
             }),
             Verdict::Allow
@@ -231,14 +238,14 @@ mod tests {
         let core = VerdictCore { protected: &pset, signatures: &sigs };
         assert!(core
             .decide(&Event::Truncate {
-                path: PathBuf::from("/home/u/Documents/notes.md"),
+                path: PathId::single(PathBuf::from("/home/u/Documents/notes.md")),
                 exists: true,
             })
             .is_deny());
         // 新建文件(O_TRUNC 但不存在)是写入不是销毁
         assert_eq!(
             core.decide(&Event::Truncate {
-                path: PathBuf::from("/home/u/Documents/new.md"),
+                path: PathId::single(PathBuf::from("/home/u/Documents/new.md")),
                 exists: false,
             }),
             Verdict::Allow
