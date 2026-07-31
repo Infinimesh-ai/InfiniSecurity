@@ -11,6 +11,13 @@ Type=simple
 ExecStart=/usr/local/bin/infinisecd --policy /etc/infinisec/policy.toml
 Restart=always
 RestartSec=1
+# 关掉启动频率限制:防御系统不该因为"重启太频繁"就放弃重启。
+# systemd 默认 10 秒内 5 次就进入 start-limit-hit 并永久停在失败态
+# ——那意味着一次密集的策略变更(或有人故意反复触发重启)就能让防御
+# 彻底下线。宁可一直重试。
+# (fail-closed 仍然成立:daemon 不在时 infsec run 拒绝启动被监督进程,
+#  LSM 层的 anti-tamper 也不依赖它。)
+StartLimitIntervalSec=0
 
 # ---- 最小特权加固 ----
 # 需要保留的能力:

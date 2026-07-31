@@ -22,6 +22,18 @@ paths = [
 # 任意位置的 .git 目录(仓库历史,事故中最痛的损失)
 git_dirs = true
 
+# 系统级 eBPF LSM 层(M6)的作用域 —— 与上面的 paths 是两回事。
+# 内核层没有分级能力,只放"任何进程在任何情况下都不该删"的那部分:
+# infsec 自己的策略、审计、隔离区、快照(anti-tamper)。
+# 往这里加路径要想清楚代价:该目录内的任何工具都将无法删除任何东西
+# (实测:git commit 会删不掉 .git/HEAD.lock,进而卡死后续所有 git 操作)。
+lsm_absolute = [
+    "/etc/infinisec",
+    "/var/log/infinisec",
+    "/var/lib/infinisec",
+    "@SUPERVISED_HOME@/.infinisec",
+]
+
 # ---- 签名库(PLAN 2.2):命中即 EPERM,不进二审,Agent 不可申诉 ----
 # 匹配对象是 execve 的 argv 向量,逐参数匹配。
 # 规则内的命令字符串是匹配模式(数据),不是可执行样本。

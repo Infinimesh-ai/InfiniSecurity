@@ -12,6 +12,7 @@
 
 mod backup;
 mod burst;
+mod lsm;
 mod merge;
 mod pipeline;
 mod quarantine;
@@ -164,6 +165,38 @@ fn run() -> Result<()> {
         args.policy.display(),
         policy.mode
     );
+
+    // LSM 层(M6)在位时,把保护前缀同步进 BPF map 并登记自身 pid 为豁免。
+    // 不在位不是错误——它是可选的系统级兜底,seccomp 层独立成立。
+    if lsm::loaded() {
+        let expanded = expand_all_lsm_paths(&policy);
+        match lsm::sync_prefixes(&expanded) {
+            Ok(skipped) => {
+                if !skipped.is_empty() {
+                    // 悄悄少保护一个目录是最糟的失败方式,必须喊出来
+                    eprintln!("infinisecd: ⚠ 以下保护路径未能进入 LSM 层:");
+                    for s in &skipped {
+                        eprintln!("infinisecd: ⚠   {s}");
+                    }
+                }
+                let enforce = policy.mode == Mode::Enforce;
+                if let Err(e) = lsm::set_config(enforce, std::process::id()) {
+                    eprintln!("infinisecd: ⚠ LSM 配置写入失败: {e}");
+                } else {
+                    eprintln!(
+                        "infinisecd: LSM 层已同步({} 条 anti-tamper 前缀,mode={:?});\n\
+                         infinisecd: 分级保护仍由 seccomp 层负责——内核层没有分级能力,\n\
+                         infinisecd: 把整个保护集喂给它会让普通工具连自己的临时文件都删不掉",
+                        expanded.len() - skipped.len(),
+                        policy.mode
+                    );
+                }
+            }
+            Err(e) => eprintln!("infinisecd: ⚠ LSM 前缀同步失败: {e}"),
+        }
+    } else if lsm::kernel_supports() {
+        eprintln!("infinisecd: 内核支持 bpf LSM 但程序未加载(systemctl start infinisec-lsm)");
+    }
 
     let session_seq = Arc::new(AtomicU64::new(1));
     for conn in listener.incoming() {
@@ -876,23 +909,43 @@ fn run_pipeline(
 
     match outcome {
         pipeline::Outcome::Deny { why } => PipelineResult::Deny(why),
+        // 免隔离区的放行(S0 可再生物、或隔离区关闭):删除仍由 daemon 执行,
+        // 理由同上——保护路径上的真 syscall 会撞上 LSM 层。
+        pipeline::Outcome::Allow { after: pipeline::AfterAllow::Direct, why }
+            if op == merge::OpKind::Remove =>
+        {
+            match daemon_delete(&target) {
+                Ok(()) => PipelineResult::AllowQuarantined(format!("{why};已直接删除(免隔离区)")),
+                Err(e) => PipelineResult::Deny(format!("{why};但删除失败: {e}")),
+            }
+        }
         pipeline::Outcome::Allow { after: pipeline::AfterAllow::Direct, why } => {
             PipelineResult::AllowDirect(why)
         }
         pipeline::Outcome::Allow { after: pipeline::AfterAllow::Quarantine, why } => {
             let stamp = pipeline::batch_stamp(session.batch_seq.fetch_add(1, Ordering::Relaxed));
             match op {
-                // 删除:先把文件保全进隔离区,再决定怎么回应 syscall
+                // 删除:先把文件保全进隔离区,再由 **daemon 自己**完成删除。
+                //
+                // 为什么不让真 syscall 跑:M6 的 LSM 层对保护路径做无条件
+                // 拦截,真 syscall 会被内核挡下,而 seccomp 层这边已经记了
+                // allow——审计说放行、用户看到 Permission denied,两层各说
+                // 各话(VM 验收实测到这个矛盾)。daemon 是 LSM 的豁免方,
+                // 由它执行删除,真 syscall 永不触及保护路径,两层从结构上
+                // 不可能打架,审计也与实际结果一致。
                 merge::OpKind::Remove => match quarantine::preserve(&session.home, &target, &stamp) {
-                    // 已原子移走,syscall 不必真跑
+                    // 已原子移走,原路径上的文件没了,直接合成成功
                     Ok(quarantine::Preserved::Moved(dest)) => PipelineResult::AllowQuarantined(
                         format!("{why};已隔离至 {}", dest.display()),
                     ),
-                    // 跨文件系统只复制了副本,原件还在,真 syscall 要照常执行
-                    Ok(quarantine::Preserved::Copied(dest)) => PipelineResult::AllowDirect(format!(
-                        "{why};跨文件系统,已复制副本至 {}(属主/xattr 不保留)",
-                        dest.display()
-                    )),
+                    // 跨文件系统:副本已就位,原件由 daemon 删掉
+                    Ok(quarantine::Preserved::Copied(dest)) => match daemon_delete(&target) {
+                        Ok(()) => PipelineResult::AllowQuarantined(format!(
+                            "{why};跨文件系统,已复制副本至 {}(属主/xattr 不保留)",
+                            dest.display()
+                        )),
+                        Err(e) => PipelineResult::Deny(format!("{why};副本已留但删除原件失败: {e}")),
+                    },
                     // 保全失败就不放行——"放行"的前提是错了能恢复
                     Err(e) => PipelineResult::Deny(format!("{why};但隔离区写入失败,拒绝放行: {e}")),
                 },
@@ -909,6 +962,19 @@ fn run_pipeline(
                 }
             }
         }
+    }
+}
+
+/// daemon 代替被监督进程执行删除。
+///
+/// 只在判决已经放行之后调用。目录用 remove_dir(空目录才删得掉,与
+/// rmdir 语义一致),其余用 remove_file。
+fn daemon_delete(target: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(target)?;
+    if meta.is_dir() {
+        std::fs::remove_dir(target)
+    } else {
+        std::fs::remove_file(target)
     }
 }
 
@@ -1007,6 +1073,7 @@ fn dispatch_control(policy: &Policy, uid: u32, req: ControlRequest) -> ControlRe
                 Err(e) => ControlResponse::err(format!("{e}")),
             }
         }
+        ControlRequest::LsmStatus => ControlResponse::ok(lsm::status_lines()),
         ControlRequest::RecoverChecklist { stage } => {
             let stages: Vec<recover::Stage> = match stage.as_deref() {
                 None => recover::Stage::all().to_vec(),
@@ -1327,4 +1394,39 @@ fn write_last_drill(home: &Path, src: &Path, stamp: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(p, stamp);
+}
+
+/// 把 LSM 层的绝对保护路径展开(`~` 按各真实用户展开)。
+///
+/// 注意用的是 `protect.lsm_absolute` 而**不是** `protect.paths`:
+/// 内核层只承担 anti-tamper,理由见 policy.rs 里那个字段的注释。
+/// LSM 没有会话上下文,只能用绝对路径,所以要为每个有 home 的用户
+/// 各展开一份。
+fn expand_all_lsm_paths(policy: &Policy) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in &policy.protect.lsm_absolute {
+        if let Some(rest) = p.strip_prefix("~/") {
+            for home in real_user_homes() {
+                out.push(home.join(rest).display().to_string());
+            }
+        } else if p == "~" {
+            for home in real_user_homes() {
+                out.push(home.display().to_string());
+            }
+        } else {
+            out.push(p.clone());
+        }
+    }
+    out
+}
+
+/// /home 下的真实用户目录。
+fn real_user_homes() -> Vec<PathBuf> {
+    std::fs::read_dir("/home")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect()
 }

@@ -87,6 +87,8 @@ pub enum ControlRequest {
         #[serde(default)]
         stage: Option<String>,
     },
+    /// eBPF LSM 系统级拦截层的状态。
+    LsmStatus,
     /// 三层只读门禁校验(PLAN 3.3 / SOP §3.3.4)。
     RecoverGate {
         device: String,

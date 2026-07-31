@@ -35,7 +35,9 @@ command -v infsec >/dev/null || { echo "找不到 infsec" >&2; exit 1; }
 command -v git >/dev/null || { echo "M2 验收需要 git" >&2; exit 1; }
 
 cleanup() {
+    infsec thaw >/dev/null 2>&1
     asroot sed -i "\|infsec-m2-fixture-$$|d" "$POLICY"
+    asroot sed -i 's/^max_files = 5000/max_files = 50/' "$POLICY"
     asroot systemctl restart infinisecd
     # 只用 unlink/rmdir 清理(纪律 1)
     find "$FIX" -type f -exec unlink {} \; 2>/dev/null
@@ -146,6 +148,12 @@ infsec run --profile interactive --may-delete "$FIX/withremote/**" -- unlink tmp
 
 # ---------- ⑦ 合并判决(性能生死线)----------
 note "⑦ 合并判决:300 文件批量删除只触发一次完整判决"
+# 这一项与 M3 的爆发检测天然冲突:300 次删除必然超过默认速率阈值(50),
+# 进程树会被冻结,批量删除永远跑不完。那是爆发检测的**正确**行为,
+# 不是缺陷。为了单独度量合并判决,这里临时把阈值抬高,测完恢复。
+# (M3 验收专门验爆发检测本身。)
+asroot sed -i 's/^max_files = 50$/max_files = 5000/' "$POLICY"
+asroot systemctl restart infinisecd; sleep 1
 CACHED_BEFORE=$(asroot grep -c 'cached-grant' "$AUDIT" 2>/dev/null | tr -d '[:space:]')
 CACHED_BEFORE=${CACHED_BEFORE:-0}
 T0=$(date +%s%N)
@@ -158,6 +166,8 @@ CACHED=$(( CACHED_AFTER - CACHED_BEFORE ))
 echo "  剩余文件 $LEFT,耗时 ${MS}ms,缓存命中 $CACHED 次"
 [[ $LEFT -eq 0 ]] && chk PASS "300 文件批量删除完成" || chk FAIL "剩余 $LEFT 个未删"
 [[ $CACHED -ge 250 ]] && chk PASS "合并判决生效($CACHED 次走缓存)" || chk FAIL "合并判决未生效(仅 $CACHED 次缓存)"
+asroot sed -i 's/^max_files = 5000$/max_files = 50/' "$POLICY"
+asroot systemctl restart infinisecd; sleep 1
 
 # ---------- ⑧ 签名层不可被分级绕过 ----------
 note "⑧ 签名层优先于一切分级"

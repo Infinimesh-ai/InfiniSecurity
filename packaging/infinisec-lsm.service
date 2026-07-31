@@ -1,0 +1,25 @@
+# InfiniSecurity 系统级 LSM 层(M6)。
+#
+# 与 infinisecd 的关系是**兜底**而不是重复:
+#   - seccomp 层(infinisecd)覆盖经 infsec run 启动的进程树,做精细判决;
+#   - LSM 层覆盖全系统(含未经 infsec run 启动的进程),只做 T0 绝对拦截。
+# 两层都在时,先经过哪层取决于 syscall 路径,但拒绝语义一致。
+#
+# 前置:内核参数含 lsm=...,bpf(改 /etc/default/grub 后 update-grub 并重启)。
+
+[Unit]
+Description=InfiniSecurity system-wide eBPF LSM enforcement
+Documentation=https://github.com/Infinimesh-ai/InfiniSecurity
+After=local-fs.target
+Before=infinisecd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/sh -c 'grep -q bpf /sys/kernel/security/lsm || { echo "内核未启用 bpf LSM(内核参数需含 lsm=...,bpf)"; exit 1; }'
+ExecStartPre=/bin/mkdir -p /sys/fs/bpf/infsec
+ExecStart=/usr/local/bin/infsec-lsm-load
+ExecStop=/bin/sh -c 'rm -rf /sys/fs/bpf/infsec'
+
+[Install]
+WantedBy=multi-user.target

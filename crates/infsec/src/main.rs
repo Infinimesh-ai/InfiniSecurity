@@ -43,6 +43,7 @@ fn usage() -> ! {
     eprintln!("  infsec backup status         快照/离机副本/演练三项检查,缺项告警");
     eprintln!("  infsec backup now            立即对保护目录做增量快照");
     eprintln!("  infsec drill <保护目录>      从最近快照实际恢复并逐文件验哈希");
+    eprintln!("  infsec lsm status            系统级 eBPF LSM 层状态");
     eprintln!("  infsec recover checklist [阶段]  取证恢复向导的阶段检查清单");
     eprintln!("  infsec recover gate <设备> [挂载点] [--confirm-host-readonly]");
     eprintln!("                               三层只读门禁校验(不齐不放行)");
@@ -108,6 +109,12 @@ fn real_main() -> Result<()> {
             return match argv.get(2).map(String::as_str) {
                 Some("status") => control(ControlRequest::BackupStatus),
                 Some("now") => control(ControlRequest::BackupNow),
+                _ => usage(),
+            }
+        }
+        Some("lsm") => {
+            return match argv.get(2).map(String::as_str) {
+                Some("status") | None => control(ControlRequest::LsmStatus),
                 _ => usage(),
             }
         }

@@ -179,6 +179,28 @@ pub struct Protect {
     /// 任意位置的 `.git` 目录(含其内容)视为保护对象。
     #[serde(default = "default_true")]
     pub git_dirs: bool,
+    /// **系统级 LSM 层(M6)的作用域**,与上面的 `paths` 是两回事。
+    ///
+    /// 内核层没有分级能力:它看不到 git 状态、算不出路径语义、更调不了
+    /// 二审。把整个 `paths` 喂给它的后果是把普通工具打坏——VM 验收里
+    /// `git commit` 删不掉自己的临时对象和 `HEAD.lock`,而残留的
+    /// HEAD.lock 会卡死后续所有 git 操作。
+    ///
+    /// 所以这里只放"任何进程在任何情况下都不该删"的那部分:infsec 自己的
+    /// 策略、审计、隔离区、快照(anti-tamper)。分级保护由 seccomp 层负责。
+    /// 用户可以自行加入更多绝对路径,但要清楚代价:那个目录里的任何工具
+    /// 都将无法删除任何东西。
+    #[serde(default = "default_lsm_absolute")]
+    pub lsm_absolute: Vec<String>,
+}
+
+fn default_lsm_absolute() -> Vec<String> {
+    vec![
+        "/etc/infinisec".to_string(),
+        "/var/log/infinisec".to_string(),
+        "/var/lib/infinisec".to_string(),
+        "~/.infinisec".to_string(),
+    ]
 }
 
 fn default_true() -> bool {

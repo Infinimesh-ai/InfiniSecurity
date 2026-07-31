@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# 加载 eBPF LSM 程序并 pin 到 bpffs。
+#
+# 用 bpftool 而不是 libbpf 绑定:少一个 C 依赖,加载过程也能被人一步步
+# 手工复现(排障时这点很重要)。
+set -euo pipefail
+
+OBJ=${INFSEC_LSM_OBJ:-/usr/local/lib/infinisec/infsec_lsm.bpf.o}
+PIN=/sys/fs/bpf/infsec
+
+[[ -f $OBJ ]] || { echo "找不到 BPF 对象 $OBJ(先在目标机上跑 bpf/build.sh)" >&2; exit 1; }
+grep -q bpf /sys/kernel/security/lsm || { echo "内核未启用 bpf LSM" >&2; exit 1; }
+
+mkdir -p "$PIN"
+# 已加载则先清掉,保证幂等
+rm -rf "$PIN"/* 2>/dev/null || true
+
+# 加载程序与 map。注意 pinmaps 是必需的:只给 loadall 一个目录只会 pin
+# 程序,map 不会被 pin,用户态就没法写策略进去(VM 验收里踩过)。
+mkdir -p "$PIN/prog"
+bpftool prog loadall "$OBJ" "$PIN/prog" pinmaps "$PIN" autoattach
+
+echo "已加载并 attach:"
+ls "$PIN"
+echo "--- LSM link ---"
+bpftool link list 2>/dev/null | grep -A2 lsm | head -10 || true
