@@ -15,6 +15,7 @@ mod burst;
 mod merge;
 mod pipeline;
 mod quarantine;
+mod recover;
 mod review;
 mod snapshot;
 mod tracee;
@@ -1005,6 +1006,66 @@ fn dispatch_control(policy: &Policy, uid: u32, req: ControlRequest) -> ControlRe
                 ),
                 Err(e) => ControlResponse::err(format!("{e}")),
             }
+        }
+        ControlRequest::RecoverChecklist { stage } => {
+            let stages: Vec<recover::Stage> = match stage.as_deref() {
+                None => recover::Stage::all().to_vec(),
+                Some(name) => match recover::Stage::all()
+                    .iter()
+                    .find(|s| s.as_str() == name)
+                    .copied()
+                {
+                    Some(s) => vec![s],
+                    None => {
+                        return ControlResponse::err(format!(
+                            "未知阶段 {name};可用:{}",
+                            recover::Stage::all()
+                                .iter()
+                                .map(|s| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" / ")
+                        ))
+                    }
+                },
+            };
+            let mut lines = Vec::new();
+            for (i, s) in stages.iter().enumerate() {
+                lines.push(format!("阶段 {}:{}", i + 1, s.as_str()));
+                for c in recover::stage_checklist(*s) {
+                    lines.push(format!("  - {c}"));
+                }
+            }
+            ControlResponse::ok(lines)
+        }
+        ControlRequest::RecoverGate { device, mountpoint, host_confirmed } => {
+            let gate = recover::check_readonly_gate(
+                Path::new(&device),
+                mountpoint.as_deref().map(Path::new),
+            );
+            let gate = if host_confirmed {
+                recover::with_host_confirmed(gate)
+            } else {
+                gate
+            };
+            let mut lines = vec![format!("三层只读门禁:{}", device)];
+            for c in &gate.checks {
+                lines.push(format!(
+                    "  [{}] {}: {}",
+                    if c.passed { "✓" } else { "✗" },
+                    c.name,
+                    c.detail
+                ));
+            }
+            if gate.passed() {
+                lines.push("门禁通过,可以进入枚举阶段".into());
+            } else {
+                lines.push(format!(
+                    "门禁未通过({} 项未过),拒绝进入枚举阶段——\
+                     缺任何一层都意味着存在一条能写到证据上的路径",
+                    gate.failures().len()
+                ));
+            }
+            ControlResponse::ok(lines)
         }
         ControlRequest::BackupStatus => {
             let mut lines = Vec::new();

@@ -312,25 +312,18 @@ mod tests {
         Decision { op: OpKind::Remove, path, size: 10, risk: r, evidence: ev() }
     }
 
-    /// 造一个总是回 allow 的后端(fixture 脚本,不是真 LLM)。
+    /// 造一个给定回答的后端。用 `sh -c` 内联,不落脚本文件——
+    /// 写文件再 exec 会引入文件系统竞态(并行跑测试时偶发失败)。
     fn fixture_reviewer(name: &str, verdict: &str, conf: f64) -> Reviewer {
-        let script = std::env::temp_dir()
-            .join(format!("infsec-pipe-{}-{name}.sh", std::process::id()));
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\ncat >/dev/null\necho '{{\"verdict\":\"{verdict}\",\"confidence\":{conf},\"reason\":\"fixture\"}}'\n"
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(
-            &script,
-            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
-        )
-        .unwrap();
         Reviewer {
             name: name.into(),
-            argv: vec![script.display().to_string()],
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!(
+                    "cat >/dev/null; echo '{{\"verdict\":\"{verdict}\",\"confidence\":{conf},\"reason\":\"fixture\"}}'"
+                ),
+            ],
             run_as_uid: None,
             run_as_gid: None,
         }

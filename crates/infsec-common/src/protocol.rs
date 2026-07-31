@@ -82,6 +82,20 @@ pub enum ControlRequest {
     BackupNow,
     /// 恢复演练:从最近快照实际恢复到临时目录并逐文件验哈希。
     Drill { source: String },
+    /// 取证恢复向导:某阶段(或全部阶段)的检查清单。
+    RecoverChecklist {
+        #[serde(default)]
+        stage: Option<String>,
+    },
+    /// 三层只读门禁校验(PLAN 3.3 / SOP §3.3.4)。
+    RecoverGate {
+        device: String,
+        #[serde(default)]
+        mountpoint: Option<String>,
+        /// 第三层(宿主/上游导出只读)由操作者人工确认。
+        #[serde(default)]
+        host_confirmed: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

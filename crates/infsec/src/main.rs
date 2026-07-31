@@ -43,6 +43,9 @@ fn usage() -> ! {
     eprintln!("  infsec backup status         快照/离机副本/演练三项检查,缺项告警");
     eprintln!("  infsec backup now            立即对保护目录做增量快照");
     eprintln!("  infsec drill <保护目录>      从最近快照实际恢复并逐文件验哈希");
+    eprintln!("  infsec recover checklist [阶段]  取证恢复向导的阶段检查清单");
+    eprintln!("  infsec recover gate <设备> [挂载点] [--confirm-host-readonly]");
+    eprintln!("                               三层只读门禁校验(不齐不放行)");
     eprintln!("  infsec quarantine list [批次]");
     eprintln!("  infsec quarantine restore <批次> <绝对路径>");
     eprintln!("  infsec version");
@@ -105,6 +108,22 @@ fn real_main() -> Result<()> {
             return match argv.get(2).map(String::as_str) {
                 Some("status") => control(ControlRequest::BackupStatus),
                 Some("now") => control(ControlRequest::BackupNow),
+                _ => usage(),
+            }
+        }
+        Some("recover") => {
+            return match argv.get(2).map(String::as_str) {
+                Some("checklist") => control(ControlRequest::RecoverChecklist {
+                    stage: argv.get(3).cloned(),
+                }),
+                Some("gate") => match argv.get(3) {
+                    Some(dev) => control(ControlRequest::RecoverGate {
+                        device: dev.clone(),
+                        mountpoint: argv.get(4).filter(|s| s.starts_with('/')).cloned(),
+                        host_confirmed: argv.iter().any(|a| a == "--confirm-host-readonly"),
+                    }),
+                    None => usage(),
+                },
                 _ => usage(),
             }
         }

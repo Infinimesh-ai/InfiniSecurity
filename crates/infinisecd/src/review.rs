@@ -443,20 +443,13 @@ mod tests {
             eprintln!("跳过:root 下需配降权用户");
             return;
         }
-        let script = std::env::temp_dir().join(format!("infsec-rev-{}.sh", std::process::id()));
-        std::fs::write(
-            &script,
-            "#!/bin/sh\ncat >/dev/null\necho '{\"verdict\":\"allow\",\"confidence\":0.9,\"reason\":\"fixture\"}'\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(
-            &script,
-            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
-        )
-        .unwrap();
         let r = Reviewer {
             name: "fixture".into(),
-            argv: vec![script.display().to_string()],
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "cat >/dev/null; echo '{\"verdict\":\"allow\",\"confidence\":0.9,\"reason\":\"fixture\"}'".into(),
+            ],
             run_as_uid: None,
             run_as_gid: None,
         };
@@ -470,8 +463,7 @@ mod tests {
             task_context: "t".into(),
             risk_level: "T2×S2×interactive".into(),
         };
-        let o = run_reviewer(&r, &ev, Duration::from_secs(5), TH);
+        let o = run_reviewer(&r, &ev, Duration::from_secs(10), TH);
         assert!(o.is_allow(), "{o:?}");
-        std::fs::remove_file(&script).ok();
     }
 }
