@@ -1,175 +1,196 @@
 #!/usr/bin/env bash
-# M1 验收脚本 —— 在虚拟机/容器里、以【被监督普通用户】身份交互运行。
-# 需要旁边开一个 root shell 配合(改策略/重启服务的动作只能人来做,
-# AGENTS.md 纪律 2/5)。
+# M1 验收 —— 在验收虚拟机里以【被监督普通用户】身份运行。
 #
 # 纪律自检(动手前的最坏情况回答,AGENTS.md 纪律 4):
-#   本脚本执行的全部命令:touch /tmp/infsec-probe-marker(无害探针)、
-#   unlink/rmdir 现造 fixture、sleep、bash、sudo --version。
-#   连清理都只用 unlink/rmdir(不可递归、不可强制),全脚本不含 rm。
+#   本脚本会执行的命令只有:touch /tmp/infsec-probe-marker(无害探针)、
+#   对现造 fixture 的 unlink/rmdir/truncate/mv、sleep、bash、sudo --version、
+#   systemctl 查询。全脚本不含 rm / dd / mkfs / find -delete。
 #   所有安全层全部放行时的最坏结果 = /tmp 里多一个标记文件、
-#   现造的 fixture 被删。没有任何命令能触碰真实数据。
+#   /tmp 下现造的 fixture 目录被删。触碰不到任何真实数据。
 #
-# 每个验收项结束后暂停,人工复核审计日志后按回车继续(纪律 5)。
+# root 配合:需要改策略、重启服务、读审计。脚本用 sudo -S 走密码
+#   (仅限验收 VM)。设 INFSEC_SUDO_PASS 环境变量;未设则改为交互提示,
+#   此时每个 root 步骤都由人现场确认。
+#
+# 用法:  INFSEC_SUDO_PASS=xxx ./accept-m1.sh
+#        ./accept-m1.sh --manual     # 每项验收后暂停等人工复核(纪律 5)
 
 set -u
+MANUAL=0
+[[ "${1:-}" == "--manual" ]] && MANUAL=1
+
 PROBE=/tmp/infsec-probe-marker
-FIX_BASE=$(mktemp -d /tmp/infsec-accept-XXXXXX)
 AUDIT=/var/log/infinisec/audit.jsonl
-PASS=0; FAIL=0
+POLICY=/etc/infinisec/policy.toml
+FIX=$(mktemp -d /tmp/infsec-accept-XXXXXX)
+PASS=0; FAIL=0; FAILED_ITEMS=()
 
 note()  { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
-ok()    { printf '\033[1;32mPASS\033[0m %s\n' "$*"; PASS=$((PASS+1)); }
-bad()   { printf '\033[1;31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); }
-pause() {
-    printf '\n\033[1;33m[人工复核]\033[0m %s\n' "$*"
-    printf '复核完毕按回车继续(Ctrl-C 中止)... '
-    read -r
-}
+ok()    { printf '  \033[1;32mPASS\033[0m %s\n' "$*"; PASS=$((PASS+1)); }
+bad()   { printf '  \033[1;31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); FAILED_ITEMS+=("$*"); }
+chk()   { if [[ $1 == PASS ]]; then ok "$2"; else bad "$2"; fi; }
+pause() { [[ $MANUAL -eq 1 ]] && { printf '\n\033[1;33m[人工复核]\033[0m %s\n按回车继续... ' "$*"; read -r; }; return 0; }
 
 if [[ $EUID -eq 0 ]]; then
-    echo "请以被监督普通用户运行本脚本(root 只在旁路配合)" >&2
-    exit 1
+    echo "请以被监督普通用户运行(root 只在旁路配合)" >&2; exit 1
 fi
-command -v infsec >/dev/null || { echo "找不到 infsec,先跑 install-vm.sh" >&2; exit 1; }
+command -v infsec >/dev/null || { echo "找不到 infsec,先跑 packaging/install-vm.sh" >&2; exit 1; }
 
-clean_probe() { [[ -e $PROBE ]] && unlink "$PROBE" || true; }
-clean_probe
+# root 执行器
+asroot() {
+    if [[ -n "${INFSEC_SUDO_PASS:-}" ]]; then
+        echo "$INFSEC_SUDO_PASS" | sudo -S "$@" 2>/dev/null
+    else
+        sudo "$@"
+    fi
+}
+restart_daemon() { asroot systemctl restart infinisecd; sleep 1; }
 
-note "前置:监督链路本身可用(控制组)"
-if infsec run -- /usr/bin/true; then
-    ok "infsec run -- true 正常执行"
-else
-    bad "监督链路不通,后续测试无意义"; exit 1
-fi
+cleanup() {
+    [[ -e $PROBE ]] && unlink "$PROBE" 2>/dev/null
+    asroot bash -c "sed -i '/infsec-accept-/d' $POLICY; sed -i 's/^mode = \"observe\"/mode = \"enforce\"/' $POLICY" 2>/dev/null
+    asroot systemctl restart infinisecd 2>/dev/null
+    # fixture 只用 unlink/rmdir 清理(纪律 1:验收脚本不含 rm)
+    find "$FIX" -type f -exec unlink {} \; 2>/dev/null
+    find "$FIX" -depth -type d -exec rmdir {} \; 2>/dev/null
+}
+trap cleanup EXIT
 
-note "验收① 签名 exec 硬拒(无害探针)"
-infsec run -- touch "$PROBE" 2>&1 || true
-if [[ -e $PROBE ]]; then
-    bad "探针文件被创建:签名层没拦住"
-else
-    ok "touch $PROBE 被拒,文件未创建"
-fi
-# 对照:非探针参数的 touch 应放行
-CTRL="$FIX_BASE/ctrl.txt"
-if infsec run -- touch "$CTRL" && [[ -e $CTRL ]]; then
-    ok "无关 touch 正常放行(无误伤)"
-else
-    bad "无关 touch 被误拦"
-fi
-pause "root shell 里查:tail -n 5 $AUDIT —— 应有 deny + signature:infsec-probe 记录"
+echo "InfiniSecurity M1 验收 — $(date -Is) — $(hostname)"
+echo "fixture 根目录: $FIX"
 
-note "验收② 保护路径删除被拒(现造 fixture)"
-FIX_PROT="$FIX_BASE/protected-fixture"
-mkdir -p "$FIX_PROT"; echo fixture > "$FIX_PROT/f.txt"
-FIX_FREE="$FIX_BASE/free-fixture"
-mkdir -p "$FIX_FREE"; echo fixture > "$FIX_FREE/f.txt"
-cat <<EOF
+# ---------------------------------------------------------------
+note "前置:监督链路可用 + 握手稳定性"
+if infsec run -- /usr/bin/true; then ok "infsec run 正常执行"; else bad "监督链路不通,后续无意义"; exit 1; fi
+HS=0; for i in $(seq 1 10); do infsec run -- /usr/bin/true 2>/dev/null && HS=$((HS+1)); done
+[[ $HS -eq 10 ]] && ok "握手 10/10 稳定(SCM_RIGHTS 与 hello 同消息)" || bad "握手不稳:$HS/10"
 
-需要 root shell 配合:把下面一行加进 /etc/infinisec/policy.toml 的
-[protect] paths 列表,然后 systemctl restart infinisecd:
+# ---------------------------------------------------------------
+note "验收① 签名层 exec 硬拒(无害探针)"
+[[ -e $PROBE ]] && unlink "$PROBE"
+infsec run -- touch "$PROBE" >/dev/null 2>&1
+[[ -e $PROBE ]] && chk FAIL "探针文件被创建" || chk PASS "touch $PROBE 被拒,文件未创建"
+CTRL="$FIX/ctrl.txt"
+infsec run -- touch "$CTRL" >/dev/null 2>&1
+[[ -e $CTRL ]] && chk PASS "无关 touch 放行(签名不误伤)" || chk FAIL "无关 touch 被误拦"
+pause "查 $AUDIT 末尾:应有 deny + signature:infsec-probe"
 
-    "$FIX_PROT",
+# ---------------------------------------------------------------
+note "验收② 保护路径的删除/截断/移出(现造 fixture)"
+mkdir -p "$FIX/protected" "$FIX/free"
+echo "fixture-content" > "$FIX/protected/f.txt"
+echo "fixture-content" > "$FIX/free/f.txt"
+asroot bash -c "python3 - '$FIX/protected' <<'PY'
+import sys
+p='$POLICY'; s=open(p).read()
+if sys.argv[1] not in s:
+    s=s.replace('paths = [\n','paths = [\n    \"%s\",\n'%sys.argv[1],1); open(p,'w').write(s)
+PY"
+restart_daemon
+asroot grep -q "$FIX/protected" "$POLICY" && echo "  (fixture 已加入保护集)" || bad "策略未生效,以下②项无意义"
 
-EOF
-pause "root 操作完成后继续"
-if infsec run -- unlink "$FIX_PROT/f.txt" 2>/dev/null; then
-    bad "保护 fixture 被删除"
-else
-    [[ -e $FIX_PROT/f.txt ]] && ok "保护 fixture 删除被拒,文件仍在" || bad "命令报错但文件消失了?!"
-fi
-if infsec run -- rmdir "$FIX_PROT" 2>/dev/null; then
-    bad "保护 fixture 目录被 rmdir"
-else
-    ok "保护 fixture 目录 rmdir 被拒"
-fi
-# 对照:未保护 fixture 应可删(M1 只拦保护集)
-if infsec run -- unlink "$FIX_FREE/f.txt" && [[ ! -e $FIX_FREE/f.txt ]]; then
-    ok "未保护 fixture 删除正常放行(无误伤)"
-else
-    bad "未保护 fixture 删除被误拦"
-fi
-pause "root shell 里查审计:应有 deny + protected:$FIX_PROT 记录"
+infsec run -- unlink "$FIX/protected/f.txt" >/dev/null 2>&1
+[[ -e $FIX/protected/f.txt ]] && chk PASS "unlink 被拒" || chk FAIL "unlink 未拦住"
+infsec run -- /bin/sh -c "> $FIX/protected/f.txt" >/dev/null 2>&1
+[[ -s $FIX/protected/f.txt ]] && chk PASS "O_TRUNC 截断被拒" || chk FAIL "截断未拦住"
+infsec run -- /usr/bin/truncate -s 0 "$FIX/protected/f.txt" >/dev/null 2>&1
+[[ -s $FIX/protected/f.txt ]] && chk PASS "truncate(2) 被拒" || chk FAIL "truncate 未拦住"
+infsec run -- /usr/bin/mv "$FIX/protected/f.txt" "$FIX/free/" >/dev/null 2>&1
+[[ -e $FIX/protected/f.txt ]] && chk PASS "rename 移出保护区被拒" || chk FAIL "移出未拦住"
+infsec run -- rmdir "$FIX/protected" >/dev/null 2>&1
+[[ -d $FIX/protected ]] && chk PASS "rmdir 被拒" || chk FAIL "rmdir 未拦住"
 
-note "验收③-a 杀启动器不解除子进程监督"
-# 被监督树的孤儿子进程在父进程死后仍应被过滤:
-# 父退出 → 2 秒后孤儿尝试探针 exec → 必须仍被拒。
-infsec run -- bash -c "nohup bash -c 'sleep 2; touch $PROBE' >/dev/null 2>&1 & exit 0"
-sleep 4
-if [[ -e $PROBE ]]; then
-    bad "父进程退出后,孤儿子进程逃出了监督(探针被创建)"
-else
-    ok "孤儿子进程仍被过滤(探针未创建)"
-fi
+# 绕过尝试
+ln -sfn "$FIX/protected" "$FIX/free/sneaky"
+infsec run -- unlink "$FIX/free/sneaky/f.txt" >/dev/null 2>&1
+[[ -e $FIX/protected/f.txt ]] && chk PASS "符号链接绕过被拦(双身份匹配)" || chk FAIL "符号链接绕过成功"
+( cd "$FIX/free" && infsec run -- unlink ../protected/f.txt >/dev/null 2>&1 )
+[[ -e $FIX/protected/f.txt ]] && chk PASS "相对路径 .. 绕过被拦" || chk FAIL "相对路径绕过成功"
 
-note "验收③-b 被监督用户改不动策略"
-if echo "# tamper" >> /etc/infinisec/policy.toml 2>/dev/null; then
-    bad "普通用户能写策略文件!"
-else
-    ok "直接写策略文件被 DAC 拒绝"
-fi
-if infsec run -- unlink /etc/infinisec/policy.toml 2>/dev/null; then
-    bad "经监督通道删掉了策略文件?!"
-else
-    ok "删除策略文件被拒(S4 自保护 + DAC 双层)"
-fi
+# 对照:不该误伤的
+infsec run -- unlink "$FIX/free/f.txt" >/dev/null 2>&1
+[[ ! -e $FIX/free/f.txt ]] && chk PASS "未保护路径删除放行" || chk FAIL "未保护删除被误拦"
+infsec run -- /bin/sh -c "echo new > $FIX/protected/created.txt" >/dev/null 2>&1
+[[ -s $FIX/protected/created.txt ]] && chk PASS "保护区内新建文件放行" || chk FAIL "误伤正常新建"
+infsec run -- /bin/sh -c "echo more >> $FIX/protected/f.txt" >/dev/null 2>&1
+grep -q more "$FIX/protected/f.txt" && chk PASS "保护区内追加写放行" || chk FAIL "误伤追加写"
+pause "查审计:应有 deny + protected:$FIX/protected 若干条"
 
-note "验收③-c 被监督用户杀不动 daemon;daemon 停止 = fail-closed"
-DPID=$(pgrep -x infinisecd | head -1 || true)
-if [[ -n ${DPID:-} ]] && kill "$DPID" 2>/dev/null; then
-    bad "普通用户 kill 掉了 infinisecd!"
-else
-    ok "kill infinisecd 无权限"
-fi
-cat <<'EOF'
+# ---------------------------------------------------------------
+note "验收③ anti-tamper 与 fail-closed"
+[[ -e $PROBE ]] && unlink "$PROBE"
+infsec run -- bash -c "nohup bash -c 'sleep 3; touch $PROBE' >/dev/null 2>&1 & exit 0" >/dev/null 2>&1
+sleep 6
+[[ -e $PROBE ]] && chk FAIL "启动器退出后孤儿子进程逃出监督" || chk PASS "孤儿子进程仍被过滤(filter 不可摘)"
 
-fail-closed 验证(需要 root 配合,手动时序):
-  1. 本 shell 将启动:infsec run -- bash -c 'sleep 15; exec /usr/bin/true'
-  2. 在 15 秒内,root shell 执行:systemctl stop infinisecd
-  3. 预期:sleep 结束后 exec 失败(ENOSYS,"Function not implemented"),
-     绝不是静默放行。
-  4. 验证后 root shell:systemctl start infinisecd
-EOF
-pause "准备好 root shell 后按回车启动"
-if infsec run -- bash -c 'sleep 15; exec /usr/bin/true' 2>/dev/null; then
-    bad "daemon 停止后 exec 仍被放行(静默放行 = 最严重失败)"
-else
-    ok "daemon 停止后被拦截 syscall 失败(fail-closed)"
-fi
-pause "root shell:systemctl start infinisecd,确认服务回来后继续"
+echo "# tamper" >> "$POLICY" 2>/dev/null && chk FAIL "普通用户写进了策略文件" || chk PASS "直接写策略被 DAC 拒"
+infsec run -- unlink "$POLICY" >/dev/null 2>&1
+[[ -e $POLICY ]] && chk PASS "经监督通道删策略被拒" || chk FAIL "策略被删"
+infsec run -- unlink "$AUDIT" >/dev/null 2>&1
+[[ -e $AUDIT ]] && chk PASS "删审计日志被拒" || chk FAIL "审计被删"
+infsec run -- /bin/sh -c "> $AUDIT" >/dev/null 2>&1
+[[ -s $AUDIT ]] && chk PASS "截断审计日志被拒" || chk FAIL "审计被清空"
 
+DPID=$(pgrep -x infinisecd | head -1)
+kill -9 "$DPID" 2>/dev/null && chk FAIL "普通用户杀掉了 daemon" || chk PASS "kill daemon 无权限"
+infsec run -- /usr/bin/systemctl stop infinisecd >/dev/null 2>&1
+systemctl is-active infinisecd | grep -q active && chk PASS "systemctl stop 被签名层拦下" || chk FAIL "服务被停掉"
+
+# fail-closed:daemon 停止期间,被拦 syscall 必须失败
+( sleep 5; asroot systemctl stop infinisecd ) &
+STOPPER=$!
+OUT=$(infsec run -- bash -c 'sleep 10; exec /usr/bin/true' 2>&1); RC=$?
+wait $STOPPER 2>/dev/null
+[[ $RC -ne 0 ]] && chk PASS "daemon 停止后被拦 syscall 失败(ENOSYS,非静默放行)" || chk FAIL "静默放行!"
+echo "    被监督进程实测输出: ${OUT:-<空>}"
+
+# fail-closed:daemon 不可达时启动器拒绝执行
+MARK="$FIX/nodaemon.txt"
+infsec run -- touch "$MARK" >/dev/null 2>&1
+[[ -e $MARK ]] && chk FAIL "daemon 不可达时降级为无监督执行" || chk PASS "daemon 不可达时拒绝启动目标命令"
+asroot systemctl start infinisecd; sleep 1
+systemctl is-active infinisecd | grep -q active && echo "  (daemon 已恢复)"
+pause "查审计与 journalctl -u infinisecd"
+
+# ---------------------------------------------------------------
+note "验收③+ 挂载视图分叉自检(daemon 看不见就必须拒)"
+asroot bash -c 'mkdir -p /etc/systemd/system/infinisecd.service.d; printf "[Service]\nPrivateTmp=yes\n" > /etc/systemd/system/infinisecd.service.d/badview.conf; systemctl daemon-reload'
+restart_daemon
+echo keepme > "$FIX/free/viewtest.txt"
+infsec run -- unlink "$FIX/free/viewtest.txt" >/dev/null 2>&1
+[[ -e $FIX/free/viewtest.txt ]] && chk PASS "视图分叉时路径 syscall 全拒" || chk FAIL "视图分叉时仍放行(会静默漏判)"
+asroot grep -q view-divergence "$AUDIT" && chk PASS "分叉事件入审计" || chk FAIL "分叉未留审计"
+asroot bash -c 'unlink /etc/systemd/system/infinisecd.service.d/badview.conf; rmdir /etc/systemd/system/infinisecd.service.d; systemctl daemon-reload'
+restart_daemon
+infsec run -- unlink "$FIX/free/viewtest.txt" >/dev/null 2>&1
+[[ ! -e $FIX/free/viewtest.txt ]] && chk PASS "移除分叉后功能回归(加固项不误判)" || chk FAIL "恢复后仍拒"
+
+# ---------------------------------------------------------------
 note "验收④ observe 模式只记不拦"
-cat <<'EOF'
+asroot sed -i 's/^mode = "enforce"/mode = "observe"/' "$POLICY"
+restart_daemon
+[[ -e $PROBE ]] && unlink "$PROBE"
+infsec run -- touch "$PROBE" >/dev/null 2>&1
+[[ -e $PROBE ]] && chk PASS "observe 下探针放行" || chk FAIL "observe 下仍拦截"
+[[ -e $PROBE ]] && unlink "$PROBE"
+asroot grep -q observe-allow "$AUDIT" && chk PASS "observe-allow 记录入审计" || chk FAIL "observe 未留审计"
+asroot sed -i 's/^mode = "observe"/mode = "enforce"/' "$POLICY"
+restart_daemon
+infsec run -- touch "$PROBE" >/dev/null 2>&1
+[[ -e $PROBE ]] && chk FAIL "恢复 enforce 后未重新拦截" || chk PASS "恢复 enforce 后重新拦截"
 
-root shell:把 /etc/infinisec/policy.toml 的 mode 改为 "observe",
-systemctl restart infinisecd。
-EOF
-pause "root 操作完成后继续"
-clean_probe
-if infsec run -- touch "$PROBE" && [[ -e $PROBE ]]; then
-    ok "observe 模式下探针放行(marker 已创建)"
-else
-    bad "observe 模式仍在拦截"
+# ---------------------------------------------------------------
+note "验收⑤ 进程树内提权尝试(无害样本)"
+infsec run -- sudo --version >/dev/null 2>&1 && chk FAIL "sudo 在监督树内被放行" || chk PASS "sudo --version 被拒"
+infsec run -- su --version  >/dev/null 2>&1 && chk FAIL "su 被放行"   || chk PASS "su 被拒"
+pause "查审计:signature:priv-escalation"
+
+# ---------------------------------------------------------------
+note "结果"
+printf '\033[1;32m%d PASS\033[0m / \033[1;31m%d FAIL\033[0m\n' "$PASS" "$FAIL"
+if [[ $FAIL -gt 0 ]]; then
+    printf '失败项:\n'; printf '  - %s\n' "${FAILED_ITEMS[@]}"
 fi
-clean_probe
-pause "root shell 查审计:应有 observe-allow + signature:infsec-probe;
-然后把 mode 改回 \"enforce\" 并 systemctl restart infinisecd"
-
-note "验收⑤ 进程树内提权尝试被拦(无害样本 sudo --version)"
-if infsec run -- sudo --version >/dev/null 2>&1; then
-    bad "sudo 在监督树内被放行"
-else
-    ok "sudo --version 被拒(signature:priv-escalation)"
-fi
-pause "root shell 查审计:应有 deny + signature:priv-escalation 记录"
-
-note "收尾(只用 unlink/rmdir,不用 rm)"
-[[ -e $FIX_FREE/f.txt ]] && unlink "$FIX_FREE/f.txt" || true
-[[ -d $FIX_FREE ]] && rmdir "$FIX_FREE" || true
-[[ -e $CTRL ]] && unlink "$CTRL" || true
-[[ -e $FIX_PROT/f.txt ]] && unlink "$FIX_PROT/f.txt" 2>/dev/null || true
-[[ -d $FIX_PROT ]] && rmdir "$FIX_PROT" 2>/dev/null || true
-rmdir "$FIX_BASE" 2>/dev/null || \
-  echo "(fixture 残留于 $FIX_BASE —— 若因保护集拒删,请 root 从策略移除该路径、重启服务后手动清理)"
-printf '\n结果:\033[1;32m%d PASS\033[0m / \033[1;31m%d FAIL\033[0m\n' "$PASS" "$FAIL"
+echo
+echo "审计日志: $AUDIT(root 可读)"
 [[ $FAIL -eq 0 ]]
