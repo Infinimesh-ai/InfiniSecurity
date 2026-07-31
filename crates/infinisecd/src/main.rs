@@ -20,6 +20,7 @@ mod recover;
 mod review;
 mod snapshot;
 mod tracee;
+mod unlock;
 mod verdict;
 
 use anyhow::{bail, Context, Result};
@@ -655,6 +656,18 @@ fn decide_and_respond(session: &Session, fd: i32, notif: &SeccompNotif) {
             // 拒绝不需要 TOCTOU 复验:基于陈旧数据的拒绝最多误伤一次重试
             let _ = seccomp::notif_send(fd, &seccomp::resp_deny_eperm(notif.id));
             audit_syscall(session, notif, argv.as_deref(), &paths, "deny", Some(rule), None);
+            // 桌面通知(M7):尽力而为,失败绝不影响判决
+            if session.policy.notify.on_deny {
+                unlock::notify_desktop(
+                    session.uid,
+                    "InfiniSecurity 拦截了一次破坏性操作",
+                    &format!(
+                        "{}\n{}\n查看: infsec audit --verdict deny --limit 5",
+                        paths.first().map(String::as_str).unwrap_or("(无路径)"),
+                        rule
+                    ),
+                );
+            }
         }
         (Verdict::Deny { rule }, false) => {
             let _ = seccomp::notif_send(fd, &seccomp::resp_allow_continue(notif.id));
@@ -1074,6 +1087,46 @@ fn dispatch_control(policy: &Policy, uid: u32, req: ControlRequest) -> ControlRe
             }
         }
         ControlRequest::LsmStatus => ControlResponse::ok(lsm::status_lines()),
+        ControlRequest::Audit { verdict, path: qpath, limit, session } => {
+            let q = unlock::AuditQuery { verdict, path: qpath, limit, session };
+            match unlock::query_audit(Path::new(&policy.audit_log), &q) {
+                Ok(lines) if lines.is_empty() => ControlResponse::ok(vec!["(无匹配记录)".into()]),
+                Ok(lines) => ControlResponse::ok(lines),
+                Err(e) => ControlResponse::err(format!("审计查询失败: {e}")),
+            }
+        }
+        ControlRequest::DeletionBoundary => {
+            match unlock::deletion_boundary(Path::new(&policy.audit_log)) {
+                Ok(Some(l)) => ControlResponse::ok(vec![
+                    "删除边界(第一条被放行的删除):".into(),
+                    l,
+                    "".into(),
+                    "此刻之前的状态是完好的;隔离区里应有对应条目,先查 infsec quarantine list".into(),
+                ]),
+                Ok(None) => ControlResponse::ok(vec![
+                    "没有任何被放行的删除——审计范围内没有删除边界".into(),
+                ]),
+                Err(e) => ControlResponse::err(format!("查询失败: {e}")),
+            }
+        }
+        ControlRequest::Unlock { path: upath, op, caller_pid } => {
+            // 解锁是唯一能放宽防护的通道,前置检查最严(见 unlock.rs)
+            let supervised = sessions_of(uid);
+            if let Err(e) = unlock::confirm_precheck(caller_pid, &supervised) {
+                return ControlResponse::err(format!("{e}"));
+            }
+            let target = PathBuf::from(&upath);
+            if !target.is_absolute() {
+                return ControlResponse::err("解锁目标必须是绝对路径(解锁不批发)");
+            }
+            ControlResponse::ok(vec![
+                format!("前置检查通过:调用者 pid {caller_pid} 有控制终端且不在被监督进程树内"),
+                format!("待解锁:{op} {}", target.display()),
+                "".into(),
+                "接下来由 infsec 在你的终端上要求逐字输入确认短语。".into(),
+                "这一步不能被脚本、管道或 expect 喂入——那正是它存在的意义。".into(),
+            ])
+        }
         ControlRequest::RecoverChecklist { stage } => {
             let stages: Vec<recover::Stage> = match stage.as_deref() {
                 None => recover::Stage::all().to_vec(),
@@ -1312,6 +1365,13 @@ fn freeze_and_alert(session: &Session, notif: &SeccompNotif, trigger: &burst::Tr
         frozen
     );
     eprintln!("infinisecd: 🚨 会话 {} {}", session.id, note);
+    if session.policy.notify.on_burst {
+        unlock::notify_desktop(
+            session.uid,
+            "InfiniSecurity 冻结了一个进程树",
+            &format!("{}\n恢复: infsec thaw", trigger.describe()),
+        );
+    }
     session.audit.write(&AuditRecord {
         ts: now_rfc3339(),
         session: &session.id,

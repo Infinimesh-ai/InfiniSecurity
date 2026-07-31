@@ -136,3 +136,9 @@ enabled = true
 window_secs = 10
 max_files = 50
 max_top_dirs = 3
+
+# ---- 桌面通知(M7)----
+# 尽力而为:没有桌面会话时静默跳过,通知失败绝不影响判决。
+[notify]
+on_deny = true
+on_burst = true

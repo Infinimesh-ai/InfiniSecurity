@@ -35,6 +35,8 @@ pub struct Policy {
     pub quarantine: Quarantine,
     #[serde(default)]
     pub burst: Burst,
+    #[serde(default)]
+    pub notify: Notify,
     #[serde(default, rename = "reviewer")]
     pub reviewers: Vec<ReviewerConfig>,
 }
@@ -156,6 +158,24 @@ impl Default for Burst {
 
 impl Burst {
     pub fn window(&self) -> Duration { Duration::from_secs(self.window_secs) }
+}
+
+/// 桌面通知(PLAN M7)。尽力而为:通知失败绝不影响判决。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Notify {
+    /// 拦截事件是否弹桌面通知。
+    #[serde(default = "d_true")]
+    pub on_deny: bool,
+    /// 爆发冻结是否弹桌面通知(这条几乎总该开着)。
+    #[serde(default = "d_true")]
+    pub on_burst: bool,
+}
+
+impl Default for Notify {
+    fn default() -> Self {
+        Notify { on_deny: true, on_burst: true }
+    }
 }
 
 /// 二审后端配置(PLAN 2.3 / 5.0)。

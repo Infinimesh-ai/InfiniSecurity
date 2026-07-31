@@ -89,6 +89,25 @@ pub enum ControlRequest {
     },
     /// eBPF LSM 系统级拦截层的状态。
     LsmStatus,
+    /// 审计查询。
+    Audit {
+        #[serde(default)]
+        verdict: Option<String>,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        session: Option<String>,
+    },
+    /// 找出删除边界:第一条被放行的删除(事故恢复的第一个问题)。
+    DeletionBoundary,
+    /// 人工带外解锁的前置检查。真正的确认在客户端终端完成。
+    Unlock {
+        path: String,
+        op: String,
+        caller_pid: i32,
+    },
     /// 三层只读门禁校验(PLAN 3.3 / SOP §3.3.4)。
     RecoverGate {
         device: String,

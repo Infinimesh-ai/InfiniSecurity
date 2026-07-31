@@ -43,6 +43,10 @@ fn usage() -> ! {
     eprintln!("  infsec backup status         快照/离机副本/演练三项检查,缺项告警");
     eprintln!("  infsec backup now            立即对保护目录做增量快照");
     eprintln!("  infsec drill <保护目录>      从最近快照实际恢复并逐文件验哈希");
+    eprintln!("  infsec audit [--verdict V] [--path P] [--limit N] [--all]");
+    eprintln!("                               审计查询");
+    eprintln!("  infsec boundary              找出删除边界(第一条被放行的删除)");
+    eprintln!("  infsec unlock <操作> <绝对路径>  人工带外解锁(必须在真终端交互)");
     eprintln!("  infsec lsm status            系统级 eBPF LSM 层状态");
     eprintln!("  infsec recover checklist [阶段]  取证恢复向导的阶段检查清单");
     eprintln!("  infsec recover gate <设备> [挂载点] [--confirm-host-readonly]");
@@ -56,6 +60,82 @@ fn usage() -> ! {
     eprintln!("  --may-delete 预授权可删路径(可多次),如 'dist/**';");
     eprintln!("              清单内免二审,越界按 T2/T3 处理并入审计");
     std::process::exit(2);
+}
+
+/// 人工带外解锁(PLAN M7 / AGENTS.md 纪律 2)。
+///
+/// 确认步骤刻意做成**只有坐在终端前的人能完成**:要求逐字输入一条
+/// 随机生成的确认短语。这不是防手滑的仪式感,是防自动化——脚本、
+/// 管道、expect 都无法预知短语。daemon 侧另有前置检查(控制终端、
+/// 非被监督进程),两边都过才算数。
+///
+/// 这里没有、也不会有 `--yes` 之类的旁路参数。
+fn do_unlock(op: String, path: String) -> Result<()> {
+    // 先过 daemon 侧的前置检查
+    let socket = std::env::var("INFSEC_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.into());
+    let mut stream = UnixStream::connect(&socket)
+        .with_context(|| format!("无法连接 infinisecd({socket})"))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    let req = ControlRequest::Unlock {
+        path: path.clone(),
+        op: op.clone(),
+        caller_pid: std::process::id() as i32,
+    };
+    stream.write_all(format!("{}\n", serde_json::to_string(&req)?).as_bytes())?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let resp: ControlResponse = serde_json::from_str(line.trim())?;
+    if !resp.ok {
+        bail!("{}", resp.error.unwrap_or_else(|| "前置检查未通过".into()));
+    }
+    for l in &resp.lines {
+        println!("{l}");
+    }
+
+    // 本地确认:必须是真终端
+    if unsafe { libc::isatty(0) } != 1 || unsafe { libc::isatty(1) } != 1 {
+        bail!(
+            "标准输入/输出不是终端。人工确认不接受管道、重定向或脚本喂入\n             ——这条限制本身就是安全装置的一部分(AGENTS.md 纪律 2)"
+        );
+    }
+
+    let phrase = confirmation_phrase();
+    println!();
+    println!("请逐字输入下面这行短语以确认解锁(区分大小写):");
+    println!("    {phrase}");
+    print!("> ");
+    std::io::Write::flush(&mut std::io::stdout())?;
+
+    let mut typed = String::new();
+    std::io::stdin().read_line(&mut typed)?;
+    if typed.trim() != phrase {
+        bail!("确认短语不符,解锁取消");
+    }
+
+    println!();
+    println!("确认通过。注意这张票据是**一次性、限时**的:");
+    println!("  - 只对 {op} {path} 这一条操作有效");
+    println!("  - 不会放宽同目录下的其他操作");
+    println!("  - 已写入审计");
+    std::process::exit(0);
+}
+
+/// 生成确认短语。取当前时间的低位做种子,不需要密码学强度——
+/// 它防的是自动化,不是攻击者(攻击者若能读到这个进程的输出,
+/// 就已经在终端里了)。
+fn confirmation_phrase() -> String {
+    const WORDS: &[&str] = &[
+        "确认删除", "我已复核", "知悉风险", "一次性授权",
+        "已看审计", "无法撤销", "证据已存", "手动批准",
+    ];
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0) as usize;
+    let a = WORDS[nanos % WORDS.len()];
+    let b = WORDS[(nanos / 7) % WORDS.len()];
+    format!("{a}-{b}-{:04}", nanos % 10000)
 }
 
 /// 走控制通道发一条命令并打印结果。
@@ -109,6 +189,29 @@ fn real_main() -> Result<()> {
             return match argv.get(2).map(String::as_str) {
                 Some("status") => control(ControlRequest::BackupStatus),
                 Some("now") => control(ControlRequest::BackupNow),
+                _ => usage(),
+            }
+        }
+        Some("audit") => {
+            let mut verdict = None; let mut qpath = None;
+            let mut limit = Some(20usize); let mut session = None;
+            let mut it = argv.iter().skip(2);
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--verdict" => verdict = it.next().cloned(),
+                    "--path" => qpath = it.next().cloned(),
+                    "--session" => session = it.next().cloned(),
+                    "--limit" => limit = it.next().and_then(|s| s.parse().ok()),
+                    "--all" => limit = None,
+                    _ => usage(),
+                }
+            }
+            return control(ControlRequest::Audit { verdict, path: qpath, limit, session });
+        }
+        Some("boundary") => return control(ControlRequest::DeletionBoundary),
+        Some("unlock") => {
+            return match (argv.get(2), argv.get(3)) {
+                (Some(op), Some(path)) => do_unlock(op.clone(), path.clone()),
                 _ => usage(),
             }
         }
