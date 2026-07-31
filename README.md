@@ -35,6 +35,26 @@ SparkClaw_Work 与 `~/.claude` 记忆(复盘见
 | 信任区 / 白名单 | `build/`、`node_modules/`、`/tmp` 等低价值路径直接放行,只留审计 |
 | 自我保护(anti-tamper) | 保护目录集由防御系统统一管理、Agent 只读;策略、审计、隔离区与 infsec 自身都在保护集内;**默认 root 部署**,与被监督用户隔一道特权边界(事故中 root 属主的 Docker 幸存即证据)——失控进程关不掉、也杀不掉防御系统 |
 
+## 当前状态(2026-07-31)
+
+**M0–M8 全部完成并通过验收,连续全量回归 151 项全绿。**
+详见 [docs/STATUS.md](docs/STATUS.md)(含未完成项与诚实边界),
+每个里程碑的验收报告在 `docs/M*-ACCEPTANCE.md`。
+
+验收在专用虚拟机上以真实双用户布局执行,样本一律无害;开发机自始至终
+未安装 root 服务。VM 实测暴露并修复了 10 个开发机单测覆盖不到的缺陷,
+其中最危险的一个是**挂载视图分叉让整个路径判决层静默失效**——
+审计记着 allow,文件其实被删了。
+
+```
+infsec run -- <你的 Agent 命令>     # 包住 Agent 进程树
+infsec audit / boundary             # 查判决 / 找删除边界
+infsec quarantine list / restore    # 被放行的删除都在隔离区里
+infsec backup status / drill        # 快照与恢复演练
+infsec panic / thaw                 # 应急止损
+infsec recover checklist / gate     # 引导式取证恢复
+```
+
 ## 两大支柱
 
 ### 支柱一:拦截(事前)

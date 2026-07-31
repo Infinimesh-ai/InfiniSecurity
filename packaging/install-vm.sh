@@ -72,4 +72,39 @@ else
 fi
 
 echo
-echo "安装完成。验收:以 $SUPERVISED_USER 身份运行 scripts/accept-m1.sh"
+echo "== 二审用户(PLAN 5.0:LLM 进程绝不跑 root)=="
+if id infsec-review &>/dev/null; then
+    echo "  OK:infsec-review 已存在"
+else
+    useradd -r -s /usr/sbin/nologin -d /var/lib/infinisec/review infsec-review
+    echo "  已创建 infsec-review"
+fi
+mkdir -p /var/lib/infinisec/review /var/lib/infinisec/drill
+chown infsec-review /var/lib/infinisec/review
+
+echo
+echo "== 系统级 anti-tamper(eBPF LSM,可选)=="
+if grep -q bpf /sys/kernel/security/lsm 2>/dev/null; then
+    if [[ -f "$REPO_DIR/bpf/infsec_lsm.bpf.o" ]]; then
+        mkdir -p /usr/local/lib/infinisec
+        install -m0644 "$REPO_DIR/bpf/infsec_lsm.bpf.o" /usr/local/lib/infinisec/
+        install -m0755 "$REPO_DIR/packaging/infsec-lsm-load" /usr/local/bin/
+        install -m0644 "$REPO_DIR/packaging/infinisec-lsm.service" /etc/systemd/system/
+        systemctl daemon-reload
+        systemctl enable --now infinisec-lsm && systemctl restart infinisecd
+        echo "  已加载(全系统任何进程都删不掉 infsec 自己的策略/审计/隔离区)"
+    else
+        echo "  内核支持,但缺 BPF 对象。在本机编译:cd bpf && ./build.sh"
+    fi
+else
+    echo "  内核未启用 bpf LSM。要开启:"
+    echo "    在 /etc/default/grub 的 GRUB_CMDLINE_LINUX_DEFAULT 里加"
+    echo "    lsm=landlock,lockdown,yama,integrity,apparmor,bpf,然后 update-grub 并重启"
+    echo "  (不开也能用:seccomp 层独立成立,只是没有系统级 anti-tamper)"
+fi
+
+echo
+echo "安装完成。验收(以 $SUPERVISED_USER 身份):"
+echo "  for m in 1 2 3 4 5 6 7 8; do INFSEC_SUDO_PASS=... ./scripts/accept-m\$m.sh; done"
+echo
+echo "常用命令:infsec status / audit / quarantine list / backup status / lsm status"
