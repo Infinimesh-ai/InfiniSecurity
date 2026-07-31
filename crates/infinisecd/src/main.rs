@@ -16,6 +16,7 @@ mod merge;
 mod pipeline;
 mod quarantine;
 mod review;
+mod snapshot;
 mod tracee;
 mod verdict;
 
@@ -1005,6 +1006,99 @@ fn dispatch_control(policy: &Policy, uid: u32, req: ControlRequest) -> ControlRe
                 Err(e) => ControlResponse::err(format!("{e}")),
             }
         }
+        ControlRequest::BackupStatus => {
+            let mut lines = Vec::new();
+            for p in &policy.protect.paths {
+                let src = expand_home_str(p, &home);
+                if !src.is_dir() {
+                    continue;
+                }
+                let repo = snapshot::repo_root(&home).join(sanitize(&src));
+                let remotes = git_remote_count(&src, uid);
+                let last_drill = read_last_drill(&home, &src);
+                let st = snapshot::status(&src, &repo, remotes, last_drill);
+                lines.push(format!("{}", st.source.display()));
+                lines.push(format!(
+                    "  快照 {} 份;最近 {}{}",
+                    st.snapshots,
+                    st.latest.as_deref().unwrap_or("<无>"),
+                    st.latest_age
+                        .map(|a| format!("({} 小时前)", a.as_secs() / 3600))
+                        .unwrap_or_default()
+                ));
+                lines.push(format!(
+                    "  离机副本(git 远端): {};上次演练: {}",
+                    st.git_remotes,
+                    st.last_drill.as_deref().unwrap_or("<从未>")
+                ));
+                for w in &st.warnings {
+                    lines.push(format!("  ⚠ {w}"));
+                }
+            }
+            if lines.is_empty() {
+                lines.push("没有可快照的保护目录".into());
+            }
+            ControlResponse::ok(lines)
+        }
+        ControlRequest::BackupNow => {
+            let mut lines = Vec::new();
+            for p in &policy.protect.paths {
+                let src = expand_home_str(p, &home);
+                if !src.is_dir() || !src.starts_with(&home) {
+                    continue; // 只快照本用户 home 下的保护目录
+                }
+                let repo = snapshot::repo_root(&home).join(sanitize(&src));
+                if let Err(e) = std::fs::create_dir_all(&repo) {
+                    lines.push(format!("{}: 建仓库失败 {e}", src.display()));
+                    continue;
+                }
+                let prev = snapshot::list(&repo).last().cloned();
+                let dest = repo.join(snapshot::stamp());
+                match snapshot::create(&src, &dest, prev.as_deref()) {
+                    Ok(m) => lines.push(format!(
+                        "{}: {} 个文件(复制 {},硬链接复用 {})",
+                        src.display(), m.files.len(), m.copied, m.linked
+                    )),
+                    Err(e) => lines.push(format!("{}: 快照失败 {e}", src.display())),
+                }
+                let _ = snapshot::prune(&repo, 10);
+            }
+            if lines.is_empty() {
+                lines.push("没有可快照的保护目录".into());
+            }
+            ControlResponse::ok(lines)
+        }
+        ControlRequest::Drill { source } => {
+            let src = PathBuf::from(&source);
+            let repo = snapshot::repo_root(&home).join(sanitize(&src));
+            let Some(latest) = snapshot::list(&repo).last().cloned() else {
+                return ControlResponse::err(format!("{source} 没有可演练的快照"));
+            };
+            // 演练恢复目录必须落在 daemon 可写的地方:ProtectSystem=strict
+            // 下 /tmp 对 daemon 是只读的(VM 验收里演练因此报 EROFS)。
+            let work = PathBuf::from("/var/lib/infinisec/drill").join(uid.to_string());
+            let _ = std::fs::create_dir_all(&work);
+            match snapshot::drill(&latest, &work) {
+                Ok(r) => {
+                    let mut lines = vec![
+                        format!("演练快照: {}", r.snapshot),
+                        format!("恢复到: {}", r.restored_to.display()),
+                        format!("校验 {} 个文件,用时 {:?}", r.files_checked, r.elapsed),
+                    ];
+                    if r.ok() {
+                        lines.push("结果:全部一致 ✓".into());
+                        write_last_drill(&home, &src, &r.snapshot);
+                    } else {
+                        lines.push(format!("结果:失败 —— 哈希不符 {} 个,缺失 {} 个",
+                            r.mismatches.len(), r.missing.len()));
+                        lines.extend(r.mismatches.iter().take(5).cloned());
+                        lines.extend(r.missing.iter().take(5).map(|m| format!("缺失: {m}")));
+                    }
+                    ControlResponse::ok(lines)
+                }
+                Err(e) => ControlResponse::err(format!("演练失败: {e}")),
+            }
+        }
         ControlRequest::Panic => {
             // PLAN 3.2:一键冻结本用户全部被监督进程树 + 止损检查清单。
             // 不做任何可能阻塞的事,冻结优先于一切。
@@ -1124,4 +1218,52 @@ fn panic_checklist() -> Vec<String> {
         "     考虑整机关机 + 冷镜像(宿主机层面),再走 infsec recover(M5)。".into(),
         "  6. 未提交的工作区内容最难恢复;先别急着 git checkout / reset。".into(),
     ]
+}
+
+// ---- M4 快照守护的辅助 ----
+
+fn expand_home_str(p: &str, home: &Path) -> PathBuf {
+    if p == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = p.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        PathBuf::from(p)
+    }
+}
+
+/// 把源路径压成一个安全的目录名(快照仓库按源目录分仓)。
+fn sanitize(p: &Path) -> String {
+    p.display()
+        .to_string()
+        .trim_start_matches('/')
+        .replace('/', "_")
+}
+
+/// 离机副本的近似指标:该目录所属 git 仓库的远端数。
+fn git_remote_count(dir: &Path, uid: u32) -> usize {
+    let gid = gid_of_uid(uid).unwrap_or(uid);
+    backup::BackupProbe::for_user(uid, gid)
+        .repo_state(dir)
+        .map(|r| if r.has_remote { 1 } else { 0 })
+        .unwrap_or(0)
+}
+
+fn drill_record_path(home: &Path, src: &Path) -> PathBuf {
+    snapshot::repo_root(home).join(sanitize(src)).join(".last-drill")
+}
+
+fn read_last_drill(home: &Path, src: &Path) -> Option<String> {
+    std::fs::read_to_string(drill_record_path(home, src))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn write_last_drill(home: &Path, src: &Path, stamp: &str) {
+    let p = drill_record_path(home, src);
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(p, stamp);
 }

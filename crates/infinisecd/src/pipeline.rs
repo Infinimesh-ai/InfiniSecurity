@@ -289,8 +289,10 @@ mod tests {
         PipelineConfig {
             reviewers,
             min_confidence: 0.8,
-            review_timeout: Duration::from_millis(500),
-            cosign_timeout: Duration::from_millis(500),
+            // 这些测试验的是判决逻辑,不是延迟。超时给足,
+            // 否则并行跑测试时 spawn 慢一点就会假失败。
+            review_timeout: Duration::from_secs(10),
+            cosign_timeout: Duration::from_secs(10),
             grant_limits: GrantLimits::default(),
             quarantine_enabled: true,
         }

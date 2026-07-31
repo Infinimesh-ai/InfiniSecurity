@@ -224,6 +224,21 @@ fn children_of(pid: i32) -> Vec<i32> {
 mod tests {
     use super::*;
 
+    /// 等进程状态变成(或不再是)某个值。返回是否在超时内达成。
+    fn wait_state(pid: i32, want: char, should_be: bool) -> bool {
+        for _ in 0..100 {
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return !should_be;
+            };
+            let state = stat[stat.rfind(')').unwrap() + 2..].chars().next().unwrap();
+            if (state == want) == should_be {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
     fn limits() -> BurstLimits {
         BurstLimits {
             window: Duration::from_secs(10),
@@ -348,15 +363,11 @@ mod tests {
 
         let frozen = freeze_tree(pid);
         assert!(frozen.contains(&pid), "目标进程应被冻结");
-        // /proc 状态应变为 T(stopped)
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-        let state = stat[stat.rfind(')').unwrap() + 2..].chars().next().unwrap();
-        assert_eq!(state, 'T', "SIGSTOP 后进程状态应为 T");
+        // 信号投递到 /proc 状态更新之间有延迟,机器忙时更明显——轮询而不是直接断言
+        assert!(wait_state(pid, 'T', true), "SIGSTOP 后进程状态应为 T");
 
         assert_eq!(thaw(&frozen), 1);
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-        let state = stat[stat.rfind(')').unwrap() + 2..].chars().next().unwrap();
-        assert_ne!(state, 'T', "SIGCONT 后不应仍是 T");
+        assert!(wait_state(pid, 'T', false), "SIGCONT 后不应仍是 T");
 
         let _ = child.kill();
         let _ = child.wait();

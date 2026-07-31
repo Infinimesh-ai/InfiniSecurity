@@ -76,6 +76,12 @@ pub enum ControlRequest {
     Thaw,
     /// 列出当前被冻结的进程。
     Frozen,
+    /// 备份态总览(PLAN 3.1):最近快照、离机副本、上次演练,缺项告警。
+    BackupStatus,
+    /// 立即对保护目录做一次快照。
+    BackupNow,
+    /// 恢复演练:从最近快照实际恢复到临时目录并逐文件验哈希。
+    Drill { source: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

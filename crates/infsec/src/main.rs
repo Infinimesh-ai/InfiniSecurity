@@ -40,6 +40,9 @@ fn usage() -> ! {
     eprintln!("  infsec panic                 一键冻结本用户全部被监督进程 + 止损清单");
     eprintln!("  infsec frozen                列出被冻结的进程");
     eprintln!("  infsec thaw                  人工确认后解冻");
+    eprintln!("  infsec backup status         快照/离机副本/演练三项检查,缺项告警");
+    eprintln!("  infsec backup now            立即对保护目录做增量快照");
+    eprintln!("  infsec drill <保护目录>      从最近快照实际恢复并逐文件验哈希");
     eprintln!("  infsec quarantine list [批次]");
     eprintln!("  infsec quarantine restore <批次> <绝对路径>");
     eprintln!("  infsec version");
@@ -98,6 +101,19 @@ fn real_main() -> Result<()> {
         Some("panic") => return control(ControlRequest::Panic),
         Some("thaw") => return control(ControlRequest::Thaw),
         Some("frozen") => return control(ControlRequest::Frozen),
+        Some("backup") => {
+            return match argv.get(2).map(String::as_str) {
+                Some("status") => control(ControlRequest::BackupStatus),
+                Some("now") => control(ControlRequest::BackupNow),
+                _ => usage(),
+            }
+        }
+        Some("drill") => {
+            return match argv.get(2) {
+                Some(src) => control(ControlRequest::Drill { source: src.clone() }),
+                None => usage(),
+            }
+        }
         Some("quarantine") => {
             return match argv.get(2).map(String::as_str) {
                 Some("list") => control(ControlRequest::QuarantineList {
