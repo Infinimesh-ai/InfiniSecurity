@@ -6,18 +6,21 @@ Description=InfiniSecurity supervisor daemon (seccomp unotify verdict core)
 Documentation=https://github.com/Infinimesh-ai/InfiniSecurity
 After=local-fs.target
 
+# 关掉启动频率限制:防御系统不该因为"重启太频繁"就放弃重启。
+# systemd 默认 10 秒内 5 次就进入 start-limit-hit 并**永久停在失败态**
+# ——一次密集的策略变更,或有人故意反复触发重启,就能让防御彻底下线。
+#
+# 注意这两个指令必须写在 [Unit] 段:systemd 229 起它们从 [Service] 移到了
+# [Unit],写错段会被**静默忽略**。验收里踩过这个坑——单元文件看起来改好了,
+# `systemctl show -p StartLimitIntervalUSec` 却仍是 10s,防御照样被打下线。
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/infinisecd --policy /etc/infinisec/policy.toml
 Restart=always
 RestartSec=1
-# 关掉启动频率限制:防御系统不该因为"重启太频繁"就放弃重启。
-# systemd 默认 10 秒内 5 次就进入 start-limit-hit 并永久停在失败态
-# ——那意味着一次密集的策略变更(或有人故意反复触发重启)就能让防御
-# 彻底下线。宁可一直重试。
-# (fail-closed 仍然成立:daemon 不在时 infsec run 拒绝启动被监督进程,
-#  LSM 层的 anti-tamper 也不依赖它。)
-StartLimitIntervalSec=0
 
 # ---- 最小特权加固 ----
 # 需要保留的能力:

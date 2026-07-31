@@ -12,11 +12,13 @@
 
 mod backup;
 mod burst;
+mod image;
 mod lsm;
 mod merge;
 mod pipeline;
 mod quarantine;
 mod recover;
+mod replay;
 mod review;
 mod snapshot;
 mod tracee;
@@ -1087,6 +1089,81 @@ fn dispatch_control(policy: &Policy, uid: u32, req: ControlRequest) -> ControlRe
             }
         }
         ControlRequest::LsmStatus => ControlResponse::ok(lsm::status_lines()),
+        ControlRequest::RecoverCapabilities => {
+            let mut lines = vec!["恢复对象矩阵——本机能覆盖哪几格:".into()];
+            for (name, ok, hint) in image::capability_matrix() {
+                lines.push(format!(
+                    "  [{}] {:<38} {}",
+                    if ok { "✓" } else { " " },
+                    name,
+                    if ok { String::new() } else { format!("装 {hint}") }
+                ));
+            }
+            lines.push("".into());
+            lines.push(
+                "诚实边界:BitLocker / FileVault 卷没有密钥就是密文,本产品只做到                 识别并索要密钥,不承诺破解;Apple T2 / Apple Silicon 内置 SSD                  脱机恢复不可行;SSD TRIM 后的块物理不可恢复。"
+                    .into(),
+            );
+            ControlResponse::ok(lines)
+        }
+        ControlRequest::ImageProbe { path: ipath } => {
+            match image::probe(Path::new(&ipath)) {
+                Ok(info) => {
+                    let mut lines = vec![
+                        format!("镜像: {}", info.path.display()),
+                        format!("格式: {}", info.format.as_str()),
+                        format!("虚拟大小: {} 字节", info.virtual_size),
+                        format!("backing chain: {} 层", info.chain.len()),
+                    ];
+                    for c in &info.chain {
+                        lines.push(format!("  - {c}"));
+                    }
+                    if let Some(e) = &info.encrypted {
+                        lines.push(format!("⚠ 加密卷: {e}"));
+                    }
+                    if info.chain_intact() {
+                        lines.push("链完整 ✓".into());
+                    } else {
+                        lines.push(format!(
+                            "✗ 链不完整,缺失 {:?} —— 拒绝在此镜像上恢复。\
+                             缺父镜像时恢复出的数据是残缺且看不出残缺的,\
+                             那比恢复失败更危险",
+                            info.missing
+                        ));
+                    }
+                    // 顺带看看设备级加密特征
+                    if let Some(e) = image::detect_encrypted_volume(Path::new(&ipath)) {
+                        lines.push(format!("⚠ {e}"));
+                    }
+                    ControlResponse::ok(lines)
+                }
+                Err(e) => ControlResponse::err(format!("{e}")),
+            }
+        }
+        ControlRequest::Replay { session_dir, outdir, prefix } => {
+            let sdir = session_dir
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".claude/projects"));
+            let out = PathBuf::from(&outdir);
+            if !out.is_absolute() {
+                return ControlResponse::err("输出目录必须是绝对路径");
+            }
+            match replay::replay_sessions(&sdir, prefix.as_deref().map(Path::new)) {
+                Ok(r) => match replay::write_output(&r, &out) {
+                    Ok((normal, secret)) => ControlResponse::ok(vec![
+                        format!("扫描会话文件 {} 个", r.sessions_scanned),
+                        format!("重建文件 {} 个(普通 {normal},秘密 {secret})", r.files.len()),
+                        format!("输出: {}", out.display()),
+                        "".into(),
+                        "全部条目标注为 **C 级**(会话重放):内容可信度中等,".into(),
+                        "回迁前必须人工复核。秘密文件已隔离到 secrets/(0700/0600),".into(),
+                        "不进正式恢复树——重放一次 .env 就是把秘密扩散一次。".into(),
+                    ]),
+                    Err(e) => ControlResponse::err(format!("写输出失败: {e}")),
+                },
+                Err(e) => ControlResponse::err(format!("重放失败: {e}")),
+            }
+        }
         ControlRequest::Audit { verdict, path: qpath, limit, session } => {
             let q = unlock::AuditQuery { verdict, path: qpath, limit, session };
             match unlock::query_audit(Path::new(&policy.audit_log), &q) {

@@ -49,6 +49,10 @@ fn usage() -> ! {
     eprintln!("  infsec unlock <操作> <绝对路径>  人工带外解锁(必须在真终端交互)");
     eprintln!("  infsec lsm status            系统级 eBPF LSM 层状态");
     eprintln!("  infsec recover checklist [阶段]  取证恢复向导的阶段检查清单");
+    eprintln!("  infsec recover capabilities  本机能覆盖恢复矩阵的哪几格");
+    eprintln!("  infsec recover image <镜像>  探测格式/链完整性/加密卷");
+    eprintln!("  infsec recover replay <输出目录> [会话目录] [路径前缀]");
+    eprintln!("                               会话重放恢复(C 级,秘密隔离)");
     eprintln!("  infsec recover gate <设备> [挂载点] [--confirm-host-readonly]");
     eprintln!("                               三层只读门禁校验(不齐不放行)");
     eprintln!("  infsec quarantine list [批次]");
@@ -226,6 +230,19 @@ fn real_main() -> Result<()> {
                 Some("checklist") => control(ControlRequest::RecoverChecklist {
                     stage: argv.get(3).cloned(),
                 }),
+                Some("capabilities") | Some("caps") => control(ControlRequest::RecoverCapabilities),
+                Some("image") => match argv.get(3) {
+                    Some(p) => control(ControlRequest::ImageProbe { path: p.clone() }),
+                    None => usage(),
+                },
+                Some("replay") => match argv.get(3) {
+                    Some(out) => control(ControlRequest::Replay {
+                        session_dir: argv.get(4).cloned(),
+                        outdir: out.clone(),
+                        prefix: argv.get(5).cloned(),
+                    }),
+                    None => usage(),
+                },
                 Some("gate") => match argv.get(3) {
                     Some(dev) => control(ControlRequest::RecoverGate {
                         device: dev.clone(),

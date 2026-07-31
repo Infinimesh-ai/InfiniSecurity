@@ -89,6 +89,18 @@ pub enum ControlRequest {
     },
     /// eBPF LSM 系统级拦截层的状态。
     LsmStatus,
+    /// 恢复能力矩阵:本机能覆盖恢复矩阵的哪几格。
+    RecoverCapabilities,
+    /// 探测镜像(格式、backing chain 完整性、加密卷识别)。
+    ImageProbe { path: String },
+    /// 会话重放恢复(PLAN 3.4)。
+    Replay {
+        #[serde(default)]
+        session_dir: Option<String>,
+        outdir: String,
+        #[serde(default)]
+        prefix: Option<String>,
+    },
     /// 审计查询。
     Audit {
         #[serde(default)]

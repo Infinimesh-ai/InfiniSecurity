@@ -14,7 +14,7 @@
 //! C 工具(debugfs / TSK / photorec / ddrescue),产品价值在门禁、分级、
 //! 清单与验证(PLAN 第 4 节的取舍)。
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
