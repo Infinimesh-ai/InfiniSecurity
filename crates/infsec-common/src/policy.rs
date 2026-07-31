@@ -33,6 +33,8 @@ pub struct Policy {
     pub risk: Risk,
     #[serde(default)]
     pub quarantine: Quarantine,
+    #[serde(default)]
+    pub burst: Burst,
     #[serde(default, rename = "reviewer")]
     pub reviewers: Vec<ReviewerConfig>,
 }
@@ -118,6 +120,42 @@ impl Default for Quarantine {
     fn default() -> Self {
         Quarantine { enabled: true, keep_days: d_keep_days() }
     }
+}
+
+/// 爆发检测(PLAN 2.5)。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Burst {
+    #[serde(default = "d_true")]
+    pub enabled: bool,
+    /// 滑动窗口(秒)。
+    #[serde(default = "d_burst_window")]
+    pub window_secs: u64,
+    /// 窗口内删除文件数上限。
+    #[serde(default = "d_burst_files")]
+    pub max_files: usize,
+    /// 窗口内涉及顶级目录数上限。
+    #[serde(default = "d_burst_dirs")]
+    pub max_top_dirs: usize,
+}
+
+fn d_burst_window() -> u64 { 10 }
+fn d_burst_files() -> usize { 50 }
+fn d_burst_dirs() -> usize { 3 }
+
+impl Default for Burst {
+    fn default() -> Self {
+        Burst {
+            enabled: true,
+            window_secs: d_burst_window(),
+            max_files: d_burst_files(),
+            max_top_dirs: d_burst_dirs(),
+        }
+    }
+}
+
+impl Burst {
+    pub fn window(&self) -> Duration { Duration::from_secs(self.window_secs) }
 }
 
 /// 二审后端配置(PLAN 2.3 / 5.0)。

@@ -114,3 +114,13 @@ keep_days = 7
 # name = "claude"
 # argv = ["/usr/local/bin/claude", "-p", "--allowedTools", ""]
 # run_as = "infsec-review"
+
+# ---- 爆发检测(PLAN 2.5:勒索软件行为防护的直接移植)----
+# 事故那天 rm -rf / 删完家目录只用了数十秒;逐次判决对这种场景太慢,
+# 需要独立的速率维度。触发后 SIGSTOP 冻结整棵进程树(不是 SIGKILL——
+# 保留现场与 pending syscall),人工用 infsec thaw 解冻。
+[burst]
+enabled = true
+window_secs = 10
+max_files = 50
+max_top_dirs = 3

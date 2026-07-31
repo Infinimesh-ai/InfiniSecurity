@@ -37,6 +37,9 @@ fn usage() -> ! {
     eprintln!("  infsec run [--socket S] [--intent TEXT] [--profile NAME]");
     eprintln!("             [--may-delete GLOB]... -- <cmd> [args...]");
     eprintln!("  infsec status");
+    eprintln!("  infsec panic                 一键冻结本用户全部被监督进程 + 止损清单");
+    eprintln!("  infsec frozen                列出被冻结的进程");
+    eprintln!("  infsec thaw                  人工确认后解冻");
     eprintln!("  infsec quarantine list [批次]");
     eprintln!("  infsec quarantine restore <批次> <绝对路径>");
     eprintln!("  infsec version");
@@ -92,6 +95,9 @@ fn real_main() -> Result<()> {
     match argv.get(1).map(String::as_str) {
         Some("run") => {}
         Some("status") => return control(ControlRequest::Status),
+        Some("panic") => return control(ControlRequest::Panic),
+        Some("thaw") => return control(ControlRequest::Thaw),
+        Some("frozen") => return control(ControlRequest::Frozen),
         Some("quarantine") => {
             return match argv.get(2).map(String::as_str) {
                 Some("list") => control(ControlRequest::QuarantineList {

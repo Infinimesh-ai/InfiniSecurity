@@ -11,6 +11,7 @@
 //! 返回 ENOSYS——fail-closed 由内核语义兜底,不依赖本进程善后。
 
 mod backup;
+mod burst;
 mod merge;
 mod pipeline;
 mod quarantine;
@@ -31,6 +32,7 @@ use infsec_common::Verdict;
 use std::io::Write;
 use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -63,6 +65,50 @@ fn parse_args() -> Result<Args> {
         }
     }
     Ok(Args { policy, socket })
+}
+
+/// 全局冻结登记簿:panic / thaw 要跨会话操作,所以不能只存在会话里。
+/// 键是 uid——每个用户只能冻结/解冻自己的进程。
+static FROZEN: std::sync::Mutex<Option<HashMap<u32, Vec<i32>>>> = std::sync::Mutex::new(None);
+
+fn frozen_add(uid: u32, pids: &[i32]) {
+    let mut g = FROZEN.lock().unwrap();
+    let map = g.get_or_insert_with(HashMap::new);
+    map.entry(uid).or_default().extend(pids.iter().copied());
+}
+
+fn frozen_take(uid: u32) -> Vec<i32> {
+    let mut g = FROZEN.lock().unwrap();
+    let map = g.get_or_insert_with(HashMap::new);
+    map.remove(&uid).unwrap_or_default()
+}
+
+fn frozen_list(uid: u32) -> Vec<i32> {
+    let mut g = FROZEN.lock().unwrap();
+    let map = g.get_or_insert_with(HashMap::new);
+    map.get(&uid).cloned().unwrap_or_default()
+}
+
+/// 活动会话登记簿:panic 要冻结本用户的全部被监督进程树。
+static SESSIONS: std::sync::Mutex<Option<Vec<(u32, i32)>>> = std::sync::Mutex::new(None);
+
+fn session_add(uid: u32, pid: i32) {
+    let mut g = SESSIONS.lock().unwrap();
+    g.get_or_insert_with(Vec::new).push((uid, pid));
+}
+
+fn session_remove(pid: i32) {
+    let mut g = SESSIONS.lock().unwrap();
+    if let Some(v) = g.as_mut() {
+        v.retain(|(_, p)| *p != pid);
+    }
+}
+
+fn sessions_of(uid: u32) -> Vec<i32> {
+    let g = SESSIONS.lock().unwrap();
+    g.as_ref()
+        .map(|v| v.iter().filter(|(u, _)| *u == uid).map(|(_, p)| *p).collect())
+        .unwrap_or_default()
 }
 
 fn run() -> Result<()> {
@@ -223,6 +269,10 @@ struct Session {
     pipeline: pipeline::PipelineConfig,
     /// 隔离批次序号。
     batch_seq: AtomicU64,
+    /// 爆发检测器(PLAN 2.5)。每进程树一个。
+    burst: std::sync::Mutex<burst::BurstDetector>,
+    /// 已冻结的 pid(供人工解冻)。
+    frozen: std::sync::Mutex<Vec<i32>>,
 }
 
 impl Session {
@@ -350,6 +400,11 @@ fn handle_session(
     let session_root = probe.repo_state(&cwd).map(|r| r.toplevel).or(Some(cwd.clone()));
     let profile = infsec_common::risk::Profile::parse(&hello.profile);
     let pipeline_cfg = build_pipeline(&policy);
+    let burst_limits = burst::BurstLimits {
+        window: policy.burst.window(),
+        max_files: policy.burst.max_files,
+        max_top_dirs: policy.burst.max_top_dirs,
+    };
 
     let session = Session {
         id: sid,
@@ -368,8 +423,11 @@ fn handle_session(
         grants: std::sync::Mutex::new(merge::GrantTable::default()),
         pipeline: pipeline_cfg,
         batch_seq: AtomicU64::new(1),
+        burst: std::sync::Mutex::new(burst::BurstDetector::new(burst_limits)),
+        frozen: std::sync::Mutex::new(Vec::new()),
     };
 
+    session_add(uid, peer_pid);
     session.audit.write(&AuditRecord {
         ts: now_rfc3339(),
         session: &session.id,
@@ -391,6 +449,7 @@ fn handle_session(
     });
 
     let end_note = notify_loop(&session, &notify_fd);
+    session_remove(peer_pid);
 
     session.audit.write(&AuditRecord {
         ts: now_rfc3339(),
@@ -503,6 +562,23 @@ fn decide_and_respond(session: &Session, fd: i32, notif: &SeccompNotif) {
             Some("daemon 与被监督进程文件系统视图不一致,路径判决不可信"),
         );
         return;
+    }
+
+    // 爆发检测:在判决**之前**记账(PLAN 2.5)。被拒绝的删除同样是信号
+    // ——次次被拒却仍在疯狂尝试的进程,正是最该冻结的那种。
+    if session.policy.burst.enabled {
+        if let Some(target) = burst_target(&event) {
+            let trigger = session.burst.lock().unwrap().record(&target);
+            if let Some(t) = trigger {
+                freeze_and_alert(session, notif, &t);
+                // 冻结后仍然拒掉当前这次操作:进程已停,但 pending 的
+                // syscall 需要一个明确答复,绝不能是放行。
+                let _ = seccomp::notif_send(fd, &seccomp::resp_deny_eperm(notif.id));
+                audit_syscall(session, notif, argv.as_deref(), &paths, "deny",
+                    Some("burst-freeze"), Some(&t.describe()));
+                return;
+            }
+        }
     }
 
     let core = verdict::VerdictCore {
@@ -929,6 +1005,50 @@ fn dispatch_control(policy: &Policy, uid: u32, req: ControlRequest) -> ControlRe
                 Err(e) => ControlResponse::err(format!("{e}")),
             }
         }
+        ControlRequest::Panic => {
+            // PLAN 3.2:一键冻结本用户全部被监督进程树 + 止损检查清单。
+            // 不做任何可能阻塞的事,冻结优先于一切。
+            let roots = sessions_of(uid);
+            let mut all = Vec::new();
+            for r in &roots {
+                all.extend(burst::freeze_tree(*r));
+            }
+            frozen_add(uid, &all);
+            let mut lines = vec![
+                format!("已冻结 {} 个进程(来自 {} 个被监督会话)", all.len(), roots.len()),
+            ];
+            if !all.is_empty() {
+                lines.push(format!("pid: {all:?}"));
+            }
+            lines.extend(panic_checklist());
+            lines.push("确认安全后:infsec thaw 解冻,或直接终止这些进程".into());
+            ControlResponse::ok(lines)
+        }
+        ControlRequest::Thaw => {
+            let pids = frozen_take(uid);
+            if pids.is_empty() {
+                return ControlResponse::ok(vec!["没有被冻结的进程".into()]);
+            }
+            let n = burst::thaw(&pids);
+            ControlResponse::ok(vec![format!("已解冻 {n}/{} 个进程", pids.len())])
+        }
+        ControlRequest::Frozen => {
+            let pids = frozen_list(uid);
+            if pids.is_empty() {
+                ControlResponse::ok(vec!["没有被冻结的进程".into()])
+            } else {
+                ControlResponse::ok(
+                    pids.iter()
+                        .map(|p| {
+                            let comm = std::fs::read_to_string(format!("/proc/{p}/comm"))
+                                .map(|s| s.trim().to_string())
+                                .unwrap_or_else(|_| "<已退出>".into());
+                            format!("{p}\t{comm}")
+                        })
+                        .collect(),
+                )
+            }
+        }
         ControlRequest::QuarantineRestore { stamp, path } => {
             let target = PathBuf::from(&path);
             if !target.is_absolute() {
@@ -940,4 +1060,68 @@ fn dispatch_control(policy: &Policy, uid: u32, req: ControlRequest) -> ControlRe
             }
         }
     }
+}
+
+// ---- 爆发检测 ----
+
+/// 计入爆发统计的操作:删除与移出(截断不算——它不改变文件数量,
+/// 且大批量截断的典型场景是正常构建)。
+fn burst_target(ev: &verdict::Event) -> Option<PathBuf> {
+    match ev {
+        verdict::Event::Remove { path } => Some(path.shown().to_path_buf()),
+        verdict::Event::Rename { from, .. } => Some(from.shown().to_path_buf()),
+        _ => None,
+    }
+}
+
+/// 冻结整棵进程树并告警。目标延迟 < 1 秒,所以这里不做任何可能阻塞的事:
+/// 不调二审、不等 I/O、不查网络。
+fn freeze_and_alert(session: &Session, notif: &SeccompNotif, trigger: &burst::Trigger) {
+    let pid = notif.pid as i32;
+    let frozen = burst::freeze_tree(pid);
+    session.frozen.lock().unwrap().extend(frozen.iter().copied());
+    frozen_add(session.uid, &frozen);
+
+    let note = format!(
+        "爆发检测触发:{};已 SIGSTOP 冻结 {} 个进程: {:?}。\
+         人工确认后可 kill -CONT 恢复,或直接终止进程树。",
+        trigger.describe(),
+        frozen.len(),
+        frozen
+    );
+    eprintln!("infinisecd: 🚨 会话 {} {}", session.id, note);
+    session.audit.write(&AuditRecord {
+        ts: now_rfc3339(),
+        session: &session.id,
+        event: "burst-freeze",
+        pid,
+        uid: session.uid,
+        syscall: None,
+        argv: None,
+        paths: None,
+        verdict: "freeze",
+        rule: Some("burst"),
+        note: Some(&note),
+    });
+}
+
+/// 止损检查清单(PLAN 3.2:SOP 第 1.A 节产品化)。
+///
+/// 顺序就是事故当天的顺序:先停止写盘,再判断范围,最后才谈恢复。
+/// 每一条都是那天真实付出过代价的教训。
+fn panic_checklist() -> Vec<String> {
+    vec![
+        "".into(),
+        "止损检查清单(按顺序确认):".into(),
+        "  1. 还有别的删除任务在跑吗?未被 infsec 监督的进程不会被冻结,".into(),
+        "     用 ps / lsof 确认,必要时手动 kill。".into(),
+        "  2. 停止一切对受影响文件系统的写入——每一次写盘都在降低可恢复率。".into(),
+        "  3. 判断范围:infsec audit(M7)或直接读 /var/log/infinisec/audit.jsonl,".into(),
+        "     找到第一条 allow 的删除记录,那就是删除边界。".into(),
+        "  4. 先看隔离区:infsec quarantine list —— 被 infsec 放行的删除都在那里,".into(),
+        "     可直接 restore,不必进取证流程。".into(),
+        "  5. 隔离区里没有的部分才需要取证恢复:此时**不要**继续在该磁盘上操作,".into(),
+        "     考虑整机关机 + 冷镜像(宿主机层面),再走 infsec recover(M5)。".into(),
+        "  6. 未提交的工作区内容最难恢复;先别急着 git checkout / reset。".into(),
+    ]
 }

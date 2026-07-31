@@ -70,6 +70,12 @@ pub enum ControlRequest {
     QuarantineList { #[serde(default)] stamp: Option<String> },
     /// 从隔离区恢复一个文件。
     QuarantineRestore { stamp: String, path: String },
+    /// 应急止损(PLAN 3.2):冻结本用户全部被监督进程树 + 止损检查清单。
+    Panic,
+    /// 解冻:人工确认后恢复被冻结的进程。
+    Thaw,
+    /// 列出当前被冻结的进程。
+    Frozen,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
