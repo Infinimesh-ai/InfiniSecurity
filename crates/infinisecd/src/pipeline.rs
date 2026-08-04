@@ -43,12 +43,19 @@ pub fn plan_for(level: &RiskLevel) -> (ReviewMode, AfterAllow, bool) {
         // S4 基础设施:硬拒,不进复核(PLAN 2.4.5 末行)
         (_, PathClass::S4) => (ReviewMode::Human, AfterAllow::Quarantine, false),
         (Tier::T0, _) => (ReviewMode::Human, AfterAllow::Quarantine, false),
+        // 跨界(T3)必须会签,**即便目标是可再生物**。
+        //
+        // 这一条必须排在 S0 之前:原顺序把 S0 放在 T1/T2/T3 之上,于是
+        // 任何跨界删除只要落在 node_modules/target/dist 这类目录名下,
+        // 就变成免复核 + 免隔离区。risk.rs 特意保留了"跨界碰可再生物
+        // 仍是 T3"(见 backup_tier_preserved_when_higher),却在这里被抹平。
+        // 跨界本身就是信号,不因目标便宜而消失。
+        (Tier::T3, _) => (ReviewMode::AgentDual, AfterAllow::Quarantine, false),
         // S0 可再生物:直接放行、免隔离区
         (_, PathClass::S0) => (ReviewMode::None, AfterAllow::Direct, true),
         (Tier::T1, _) => (ReviewMode::None, AfterAllow::Quarantine, true),
         (Tier::T2, PathClass::S3) => (ReviewMode::Agent, AfterAllow::Quarantine, false),
         (Tier::T2, _) => (ReviewMode::Agent, AfterAllow::Quarantine, true),
-        (Tier::T3, _) => (ReviewMode::AgentDual, AfterAllow::Quarantine, false),
     }
 }
 
@@ -99,8 +106,10 @@ pub fn decide(cfg: &PipelineConfig, grants: &mut GrantTable, d: &Decision<'_>) -
         };
     }
 
-    // 2. 判决缓存:命中即套用(deny 从不入缓存,所以命中一定是放行)
-    if let Lookup::Covered(level) = grants.lookup(d.op, d.path, d.size) {
+    // 2. 判决缓存:命中即套用(deny 从不入缓存,所以命中一定是放行)。
+    //    必须把本次的路径语义等级一起交给缓存——缓存键不含语义时,
+    //    一次 T1×S1 的放行会给整个父目录开通行证,连 .env/.git 一起放过。
+    if let Lookup::Covered(level) = grants.lookup(d.op, d.path, d.size, d.risk.path_class, d.risk.backup_tier) {
         let after = if cfg.quarantine_enabled {
             AfterAllow::Quarantine
         } else {
@@ -181,14 +190,20 @@ pub fn decide(cfg: &PipelineConfig, grants: &mut GrantTable, d: &Decision<'_>) -
     };
 
     // 5. 放行且可缓存 → 记授权(合并后续同类操作)
-    if outcome.is_allow() && cacheable {
+    //
+    // 预授权换来的放行**不进缓存**。授权记在 operation_root(父目录)上并
+    // 覆盖整棵子树,于是声明一个 `--may-delete /proj/foo.txt` 就会让同目录
+    // 下所有**未声明**的文件也免复核通过——直接推翻 risk.rs 里"预授权决定
+    // 的是允不允许,不是要不要复核"那句话。清单是逐条声明的,它的效力就该
+    // 逐条止步。
+    if outcome.is_allow() && cacheable && !d.risk.preauthorized {
         let root = crate::merge::operation_root(d.path);
         let limits = if level.tier == Tier::T2 {
             cfg.grant_limits.halved()
         } else {
             cfg.grant_limits
         };
-        grants.grant(d.op, root, desc, limits);
+        grants.grant(d.op, root, desc, level.class, level.tier, limits);
     }
 
     outcome
@@ -504,6 +519,100 @@ mod tests {
             assert!(!o.is_allow());
         }
         assert_eq!(g.active(), 0, "拒绝不产生授权");
+    }
+
+    /// 回归:跨界(T3)不因目标是可再生物而免检。
+    ///
+    /// `plan_for` 原先把 `(_, S0)` 排在 `(T3, _)` 之前,于是任何跨界删除只要
+    /// 落在 node_modules/target/dist 这类目录名下,就变成免复核 + 免隔离区。
+    /// risk.rs 特意保留了"跨界碰可再生物仍是 T3",却在这里被抹平。
+    #[test]
+    fn cross_boundary_s0_still_needs_cosign() {
+        let (mode, after, cacheable) = plan_for(&infsec_common::risk::RiskLevel {
+            tier: Tier::T3,
+            class: PathClass::S0,
+            profile: Profile::Interactive,
+        });
+        assert_eq!(mode, ReviewMode::AgentDual, "跨界必须会签,S0 也不例外");
+        assert_eq!(after, AfterAllow::Quarantine);
+        assert!(!cacheable, "跨界判决不进缓存");
+
+        // 非跨界的 S0 仍然免复核直删——不要修坏正常路径
+        let (mode, after, _) = plan_for(&infsec_common::risk::RiskLevel {
+            tier: Tier::T1,
+            class: PathClass::S0,
+            profile: Profile::Interactive,
+        });
+        assert_eq!(mode, ReviewMode::None);
+        assert_eq!(after, AfterAllow::Direct);
+    }
+
+    /// 回归:S4/S3 不得被判决缓存放行。
+    ///
+    /// 复现 `rm -rf proj/` 的真实序列:先删普通文件拿到 /proj 的授权,
+    /// 随后 .git/.env 全部命中缓存。`s4_is_never_agent_reviewable` 那条
+    /// 单测只在空缓存下成立。
+    #[test]
+    fn cache_never_opens_the_door_for_s3_s4() {
+        if skip_if_root() { return; }
+        let c = cfg(vec![]);
+        let mut g = GrantTable::default();
+
+        // 1. 普通文件免复核放行,并在 /proj 上登记授权
+        let o = decide(
+            &c,
+            &mut g,
+            &decision(Path::new("/proj/README.md"), risk(Tier::T1, PathClass::S1, Profile::Interactive)),
+        );
+        assert!(o.is_allow(), "{o:?}");
+        assert_eq!(g.active(), 1, "应当登记了一条授权");
+
+        // 2. 同目录下的 S4 必须仍然走完整判决并被拒
+        let o = decide(
+            &c,
+            &mut g,
+            &decision(Path::new("/proj/.git/config"), risk(Tier::T1, PathClass::S4, Profile::Interactive)),
+        );
+        assert!(!o.is_allow(), "S4 被缓存放行了: {o:?}");
+        assert!(!o.why().starts_with("cached-grant"), "S4 不该命中缓存: {}", o.why());
+
+        // 3. S3 同理(无二审后端 → fail-closed 拒绝)
+        let o = decide(
+            &c,
+            &mut g,
+            &decision(Path::new("/proj/.env"), risk(Tier::T2, PathClass::S3, Profile::Interactive)),
+        );
+        assert!(!o.is_allow(), "S3 被缓存放行了: {o:?}");
+        assert!(!o.why().starts_with("cached-grant"), "S3 不该命中缓存: {}", o.why());
+    }
+
+    /// 回归:预授权的放行不得外溢到同目录下未声明的文件。
+    ///
+    /// 授权记在 operation_root(父目录)上并覆盖整棵子树,于是声明一个
+    /// `--may-delete /proj/foo.txt` 会让同目录下所有未声明的文件也免复核
+    /// 通过——直接推翻 risk.rs 里"预授权决定的是允不允许,不是要不要复核"。
+    #[test]
+    fn preauthorized_allow_does_not_leak_to_siblings() {
+        if skip_if_root() { return; }
+        let c = cfg(vec![]); // 无二审后端:未声明的 T2 必须 fail-closed 拒绝
+        let mut g = GrantTable::default();
+
+        // 声明范围内的文件:预授权压到 T1 → 免复核放行
+        let mut r = risk(Tier::T2, PathClass::S1, Profile::Interactive);
+        r.preauthorized = true;
+        let o = decide(&c, &mut g, &decision(Path::new("/proj/foo.txt"), r));
+        assert!(o.is_allow(), "声明范围内应放行: {o:?}");
+        assert_eq!(g.active(), 0, "预授权换来的放行不该留下授权");
+
+        // 同目录下**未声明**的文件:真实 T2,必须仍然被拒
+        let r2 = risk(Tier::T2, PathClass::S1, Profile::Interactive);
+        let o2 = decide(&c, &mut g, &decision(Path::new("/proj/bar.txt"), r2));
+        assert!(!o2.is_allow(), "未声明的兄弟文件被预授权外溢放行了: {o2:?}");
+        assert!(
+            !o2.why().starts_with("cached-grant"),
+            "不该命中缓存: {}",
+            o2.why()
+        );
     }
 
     #[test]

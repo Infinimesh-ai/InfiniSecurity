@@ -21,7 +21,12 @@ char LICENSE[] SEC("license") = "GPL";
 
 #define MAX_PREFIXES 16
 #define PREFIX_LEN 128
-#define PATH_LEN 256
+// PATH_MAX 是 4096。原先取 256,而 bpf_d_path 在缓冲放不下时返回负数,
+// path_is_protected 把负数当成"解析不出路径"直接放行(fail-open)——
+// 于是**任何父目录路径超过 ~255 字节的删除都不受保护**。深层
+// node_modules / 构建树天天能碰到,不需要攻击者刻意去嵌套。
+// 栈上放不下 4096(BPF 栈限 512 字节),所以改用 per-CPU map 做暂存。
+#define PATH_LEN 4096
 #define EPERM 1
 
 struct prefix_t {
@@ -49,13 +54,27 @@ struct {
 } infsec_config SEC(".maps");
 
 // 拦截计数,供 `infsec lsm status` 读取。
-// idx 0: 检查次数  idx 1: 拒绝次数
+// idx 0: 检查次数  idx 1: 拒绝次数  idx 2: 路径解析失败次数
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 2);
+    __uint(max_entries, 3);
     __type(key, __u32);
     __type(value, __u64);
 } stats SEC(".maps");
+
+// 路径暂存区。BPF 栈只有 512 字节,放不下 PATH_MAX,所以走 per-CPU map。
+// per-CPU 而不是普通 array:LSM 钩子在任意 CPU 上并发触发,共享一块
+// 缓冲会让两次并发解析互相踩,判决就建立在别人的路径上了。
+struct path_buf_t {
+    char b[PATH_LEN];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct path_buf_t);
+} path_scratch SEC(".maps");
 
 static __always_inline __u64 cfg(__u32 idx)
 {
@@ -96,15 +115,27 @@ static __always_inline int has_prefix(const char *path, __u32 plen,
 
 static __always_inline int path_is_protected(const struct path *dir)
 {
-    char buf[PATH_LEN] = {};
-    long n = bpf_d_path((struct path *)dir, buf, sizeof(buf));
-    if (n <= 0)
-        return 0;  // 解析不出路径就不拦:这一层只做确定的事,
-                   // 灰区交给用户态 daemon(它有完整上下文)
+    __u32 zero = 0;
+    struct path_buf_t *pb = bpf_map_lookup_elem(&path_scratch, &zero);
+    if (!pb)
+        return 0;
+
+    long n = bpf_d_path((struct path *)dir, pb->b, PATH_LEN);
+    if (n <= 0) {
+        // 解析不出路径。这一层只做确定的事,灰区交给用户态 daemon
+        // (它有完整上下文)。但**要记账**:原先这里是静默 fail-open,
+        // 缓冲太小导致的漏保护看不出来,只会表现为"没触发过"。
+        bump(2);
+        return 0;
+    }
 
     __u32 plen = (__u32)n;
     if (plen > 0)
         plen -= 1;  // bpf_d_path 返回值含结尾 NUL
+    if (plen >= PATH_LEN)
+        plen = PATH_LEN - 1;
+
+    const char *buf = pb->b;
 
 #pragma unroll
     for (__u32 i = 0; i < MAX_PREFIXES; i++) {

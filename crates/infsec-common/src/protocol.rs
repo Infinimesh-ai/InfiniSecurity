@@ -129,6 +129,13 @@ pub enum ControlRequest {
         #[serde(default)]
         host_confirmed: bool,
     },
+    /// 执行前自查:这条命令会不会写到证据上(纪律 6)。
+    ///
+    /// 诚实边界:它**只回答问题**,不拦截你在别处敲的命令——恢复流程里
+    /// 真正执行命令的是操作者本人,infsec 不在那条链路上。之所以要有它,
+    /// 是因为写路径守卫原先只存在于单测里,而 checklist 却在对操作者
+    /// 宣称"工具会挡"。
+    RecoverCheckCmd { argv: Vec<String> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

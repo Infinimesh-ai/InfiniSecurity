@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # M5 验收 —— 引导式取证恢复:三层只读门禁 + 分级清单 + 回迁安全检查。
 #
-# 纪律自检(AGENTS.md 纪律 3/4/6:最坏会发生什么):
+# 纪律自检(AGENTS.md 纪律 1/3/4/6:最坏会发生什么):
 #   验收对象是**本脚本现造的一个 64MB 环回镜像文件**,不是任何真实磁盘。
-#   镜像里的内容是脚本自己写的几个文本文件。全脚本不含 fsck / dd 写设备 /
-#   mkfs 到真实设备(mkfs 只作用于刚 truncate 出来的镜像文件)。
+#   镜像里的内容是脚本自己写的几个文本文件。全脚本不含 rm / dd / fsck /
+#   shred / find -delete;mkfs 只作用于刚 truncate 出来的镜像文件,
+#   且动手前会确认那个路径是新建的普通文件(不是块设备、不是已存在的文件)。
 #   最坏结果 = 这个临时镜像文件损坏。
-#   门禁验收本身只做**只读校验**:blockdev --getro 读状态、读 /proc/mounts,
-#   绝不代替操作者去 --setro(对证据设备的写动作必须由人显式做出)。
+#   被测的门禁命令(infsec recover gate)本身只做**只读校验**:blockdev --getro
+#   读状态、读 /proc/mounts,绝不代替操作者去 --setro——对证据设备的写动作
+#   必须由人显式做出。脚本自己确实会 --setrw/--setro,但对象只有它用
+#   losetup 现开的那个 loop 设备,那是在布置 fixture 的三种前置状态,
+#   不是替操作者对证据设备动手。
 #
 # 用法:INFSEC_SUDO_PASS=xxx ./accept-m5.sh
 
@@ -15,13 +19,17 @@ set -u
 FIX="$HOME/infsec-m5-fixture-$$"
 IMG="$FIX/evidence.img"
 MNT="$FIX/mnt"
-PASS=0; FAIL=0; FAILED=()
+PASS=0; FAIL=0; SKIP=0; FAILED=(); SKIPPED=()
 LOOP=""
 
 note() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
+# SKIP = 前置条件不成立,本轮没测;单独计数,绝不并进 PASS。
 chk()  {
-    if [[ $1 == PASS ]]; then printf '  \033[1;32mPASS\033[0m %s\n' "$2"; PASS=$((PASS+1));
-    else printf '  \033[1;31mFAIL\033[0m %s\n' "$2"; FAIL=$((FAIL+1)); FAILED+=("$2"); fi
+    case "$1" in
+        PASS) printf '  \033[1;32mPASS\033[0m %s\n' "$2"; PASS=$((PASS+1)) ;;
+        SKIP) printf '  \033[1;33mSKIP\033[0m %s\n' "$2"; SKIP=$((SKIP+1)); SKIPPED+=("$2") ;;
+        *)    printf '  \033[1;31mFAIL\033[0m %s\n' "$2"; FAIL=$((FAIL+1)); FAILED+=("$2") ;;
+    esac
 }
 asroot() {
     if [[ -n "${INFSEC_SUDO_PASS:-}" ]]; then echo "$INFSEC_SUDO_PASS" | sudo -S "$@" 2>/dev/null
@@ -33,7 +41,9 @@ asroot() {
 cleanup() {
     asroot umount "$MNT" 2>/dev/null
     [[ -n "$LOOP" ]] && asroot losetup -d "$LOOP" 2>/dev/null
-    find "$FIX" -type f -exec unlink {} \; 2>/dev/null
+    # `! -type d` 而不是 `-type f`:后者匹配不到符号链接,于是链接留下来、
+    # 目录非空、rmdir 失败,fixture 就永远残留(VM 实测 M4 每跑一次留一个)。
+    find "$FIX" ! -type d -exec unlink {} \; 2>/dev/null
     find "$FIX" -depth -type d -exec rmdir {} \; 2>/dev/null
 }
 trap cleanup EXIT
@@ -43,7 +53,11 @@ echo "fixture 镜像: $IMG(现造,非真实磁盘)"
 mkdir -p "$FIX" "$MNT"
 
 # ---------- 造 fixture 证据镜像 ----------
+# mkfs 的目标必须是"本脚本刚建出来的普通文件",这一点在动手前验死:
+# 路径已存在就拒绝(不覆盖任何东西),建完再确认它是普通文件而不是块设备。
+[[ -e "$IMG" ]] && { echo "$IMG 已存在,拒绝覆盖" >&2; exit 1; }
 truncate -s 64M "$IMG"
+[[ -f "$IMG" && ! -b "$IMG" && ! -L "$IMG" ]] || { echo "$IMG 不是刚建出来的普通文件,拒绝 mkfs" >&2; exit 1; }
 asroot mkfs.ext4 -q -F "$IMG" 2>/dev/null || { echo "造镜像失败" >&2; exit 1; }
 LOOP=$(asroot losetup --find --show "$IMG")
 [[ -n "$LOOP" ]] || { echo "losetup 失败" >&2; exit 1; }
@@ -95,16 +109,24 @@ asroot umount "$MNT" 2>/dev/null
 note "⑤ 设备只读 + ro,noload 挂载 → 三层全绿"
 asroot blockdev --setro "$LOOP"
 asroot mount -o ro,noload "$LOOP" "$MNT" 2>/dev/null
-grep -q "$LOOP" /proc/mounts || echo "  (警告:挂载未成功)"
-OUT=$(infsec recover gate "$LOOP" "$MNT" --confirm-host-readonly 2>&1)
-echo "$OUT" | sed 's/^/  /'
-echo "$OUT" | grep -q '门禁通过' && chk PASS "ro,noload + 只读设备 + 人工确认 → 放行" || chk FAIL "全绿却不放行"
+# 挂载没成功的话,下面三条都会变成"对着空挂载点提问":门禁可能因为
+# "根本没有挂载项要检查"而报通过,那是假 PASS。没挂上就报 SKIP。
+if ! grep -q "$LOOP" /proc/mounts; then
+    chk SKIP "ro,noload 挂载未成功,三层全绿一项未测"
+    chk SKIP "同上:只读挂载下证据可读一项未测"
+    chk SKIP "同上:证据设备不可写一项未测"
+else
+    OUT=$(infsec recover gate "$LOOP" "$MNT" --confirm-host-readonly 2>&1)
+    echo "$OUT" | sed 's/^/  /'
+    echo "$OUT" | grep -q '门禁通过' && chk PASS "ro,noload + 只读设备 + 人工确认 → 放行" || chk FAIL "全绿却不放行"
 
-# 证据内容可读(只读取证是可行的)
-[[ "$(cat "$MNT/important.txt" 2>/dev/null)" == "evidence-content-v1" ]] \
-    && chk PASS "只读挂载下证据仍可读取(取证可进行)" || chk FAIL "读不到证据"
-# 证据不可写(反向保护生效)
-asroot bash -c "echo tamper > '$MNT/important.txt'" 2>/dev/null && chk FAIL "证据竟可写" || chk PASS "证据设备不可写(反向保护生效)"
+    # 证据内容可读(只读取证是可行的)
+    [[ "$(cat "$MNT/important.txt" 2>/dev/null)" == "evidence-content-v1" ]] \
+        && chk PASS "只读挂载下证据仍可读取(取证可进行)" || chk FAIL "读不到证据"
+    # 证据不可写(反向保护生效)。写的是本脚本自造镜像里的 fixture 文件,
+    # 期望是写不进去;真写进去了就是被测层失效,必须报 FAIL。
+    asroot bash -c "echo tamper > '$MNT/important.txt'" 2>/dev/null && chk FAIL "证据竟可写" || chk PASS "证据设备不可写(反向保护生效)"
+fi
 
 # ---------- ⑥ 阶段检查清单 ----------
 note "⑥ 向导阶段检查清单(SOP 产品化)"
@@ -118,6 +140,7 @@ echo "$OUT" | grep -q '隔离区' && chk PASS "止损阶段提示先查隔离区
 echo "$OUT" | grep -q '第二次数据丢失' && chk PASS "回迁阶段警示不得覆盖现存数据" || chk FAIL "缺回迁警示"
 
 note "结果"
-printf '\033[1;32m%d PASS\033[0m / \033[1;31m%d FAIL\033[0m\n' "$PASS" "$FAIL"
-[[ $FAIL -gt 0 ]] && printf '失败项:\n' && printf '  - %s\n' "${FAILED[@]}"
+printf '\033[1;32m%d PASS\033[0m / \033[1;31m%d FAIL\033[0m / \033[1;33m%d SKIP\033[0m(SKIP 不计入 PASS)\n' "$PASS" "$FAIL" "$SKIP"
+if [[ $SKIP -gt 0 ]]; then printf '跳过项(本轮未覆盖,需人工判断能否接受):\n'; printf '  - %s\n' "${SKIPPED[@]}"; fi
+if [[ $FAIL -gt 0 ]]; then printf '失败项:\n'; printf '  - %s\n' "${FAILED[@]}"; fi
 [[ $FAIL -eq 0 ]]

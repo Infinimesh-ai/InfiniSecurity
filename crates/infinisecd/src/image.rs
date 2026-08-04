@@ -132,13 +132,34 @@ pub fn probe(path: &Path) -> Result<ImageInfo> {
     // 链里声明了 backing 但那一层不在数组里 = 缺失
     let mut missing = Vec::new();
     for e in &arr {
-        if let Some(b) = e.get("backing-filename").and_then(|x| x.as_str()) {
-            if !chain.iter().any(|c| c.ends_with(b) || c == b) {
-                missing.push(b.to_string());
-            }
+        let Some(b) = e.get("backing-filename").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        // qemu 自己解析好的绝对路径优先;没有就按 qemu 的规则解析相对名——
+        // 相对**引用它的那一层**所在目录,不是 cwd。
+        let referrer = e.get("filename").and_then(|x| x.as_str()).unwrap_or("");
+        let want = e
+            .get("full-backing-filename")
+            .and_then(|x| x.as_str())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| resolve_backing(referrer, b));
+        if !chain.iter().any(|c| same_image_path(c, &want)) {
+            missing.push(b.to_string());
         }
     }
-    missing.extend(extract_missing(&stderr));
+    if !stderr.trim().is_empty() {
+        let named = extract_missing(&stderr);
+        if named.is_empty() && stderr.to_lowercase().contains("backing") {
+            // fail-closed:qemu-img 提到了 backing 却不是我们认得的措辞,
+            // 说明它可能在报一个我们没解析出来的缺层问题。宁可判链不完整。
+            missing.push(format!(
+                "qemu-img 在 stderr 里提到 backing,但本工具没能解析出具体缺哪一层\
+                 (措辞或 locale 变了?)。按链不完整处理,原文:{}",
+                stderr.trim()
+            ));
+        }
+        missing.extend(named);
+    }
     missing.sort();
     missing.dedup();
 
@@ -154,12 +175,69 @@ pub fn probe(path: &Path) -> Result<ImageInfo> {
     })
 }
 
+/// 从 qemu-img 的 stderr 里认出"缺父镜像"的报错。
+///
+/// **已知脆弱点(不要当成可靠判据)**:qemu-img 没有机器可读的缺层信号,
+/// 只在 stderr 里用英文散文报错。qemu 换一次措辞、或者进程跑在非英文
+/// locale 下,这里就一条都匹配不到。
+///
+/// 所以调用方**不能**把"匹配不到"当作"链完整":链完整性是硬门禁
+/// (缺父镜像时恢复出的数据残缺且看不出残缺,比恢复失败更危险),
+/// 匹配不到时一律保守地按链不完整处理——见 [`probe`] 里的 fail-closed 分支。
 fn extract_missing(stderr: &str) -> Vec<String> {
     stderr
         .lines()
-        .filter(|l| l.contains("Could not open backing file") || l.contains("No such file"))
+        .filter(|l| {
+            let l = l.to_lowercase();
+            l.contains("could not open backing file")
+                || l.contains("no such file")
+                || l.contains("backing file")
+        })
         .map(|l| l.trim().to_string())
         .collect()
+}
+
+/// 按 qemu 的规则把 backing 名解析成一个可比较的路径:
+/// 相对名相对**引用它的那一层镜像**所在目录,不是 cwd。
+fn resolve_backing(referrer: &str, backing: &str) -> PathBuf {
+    let b = Path::new(backing);
+    if b.is_absolute() {
+        return b.to_path_buf();
+    }
+    match Path::new(referrer).parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.join(b),
+        _ => b.to_path_buf(),
+    }
+}
+
+/// 两个镜像路径是不是同一个文件。
+///
+/// 原实现用的是 `String::ends_with` —— **字符串**后缀,不是路径后缀:
+/// `/somewhere/else/base.qcow2` 会"满足"backing 名 `base.qcow2`,
+/// 于是真正缺失的父镜像被判成存在。链完整性是硬门禁,这种假阴性
+/// 会让残缺的恢复结果看起来完好无损。
+/// 判据是**整条路径逐分量相等**。判不准时宁可判成"缺"——多拒一次只是
+/// 恢复停下来问人,判错一次是拿着残缺数据当完整的用。
+fn same_image_path(a: &str, b: &Path) -> bool {
+    normalize_lexical(Path::new(a)) == normalize_lexical(b)
+}
+
+/// 词法归一化(去掉 `.` 和能消掉的 `..`)。**不碰文件系统**:
+/// 缺失的父镜像根本不存在,canonicalize 只会失败。
+fn normalize_lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// 加密卷识别(PLAN 3.5 诚实边界)。
@@ -291,10 +369,16 @@ impl NbdAttachment {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()?;
-        self.detached = true;
         if !st.success() {
-            bail!("断开 {} 失败", self.device.display());
+            // 只有确认断开成功才置标志。先置标志会让 Drop 直接跳过重试,
+            // 断开失败的证据设备就这么一直连着——泄露的是**证据的连接**。
+            bail!(
+                "断开 {}(镜像 {})失败:该设备仍连着,请人工确认 qemu-nbd --disconnect",
+                self.device.display(),
+                self.image.display()
+            );
         }
+        self.detached = true;
         Ok(())
     }
 }
@@ -438,5 +522,59 @@ mod tests {
     #[test]
     fn probe_rejects_missing_file() {
         assert!(probe(Path::new("/definitely/not/here.qcow2")).is_err());
+    }
+
+    /// 缺陷 5:原来用 `String::ends_with` 做**字符串**后缀比较,
+    /// `/somewhere/else/base.qcow2` 会"满足" backing 名 `base.qcow2`,
+    /// 把真正缺失的父镜像判成存在。链完整性是硬门禁,这种假阴性最要命。
+    #[test]
+    fn chain_match_is_path_level_not_string_suffix() {
+        // 同名不同目录:绝不能算命中
+        assert!(!same_image_path("/other/base.qcow2", Path::new("/evi/base.qcow2")));
+        assert!(!same_image_path("/evi/xbase.qcow2", Path::new("/evi/base.qcow2")));
+        // 真正同一个文件(含 . 与 .. 的写法)要算命中
+        assert!(same_image_path("/evi/base.qcow2", Path::new("/evi/base.qcow2")));
+        assert!(same_image_path("/evi/./base.qcow2", Path::new("/evi/sub/../base.qcow2")));
+        assert!(same_image_path("base.qcow2", Path::new("base.qcow2")));
+        // 相对名相对**引用它的那一层**解析,不是 cwd
+        assert_eq!(
+            resolve_backing("/evi/top.qcow2", "base.qcow2"),
+            PathBuf::from("/evi/base.qcow2")
+        );
+        assert_eq!(
+            resolve_backing("/evi/top.qcow2", "/abs/base.qcow2"),
+            PathBuf::from("/abs/base.qcow2")
+        );
+        // 关键回归:链里只有 /other/base.qcow2 时,backing base.qcow2 必须判为缺失
+        let chain = ["/evi/top.qcow2".to_string(), "/other/base.qcow2".to_string()];
+        let want = resolve_backing("/evi/top.qcow2", "base.qcow2");
+        assert!(
+            !chain.iter().any(|c| same_image_path(c, &want)),
+            "同名不同目录不能算父镜像存在"
+        );
+    }
+
+    /// 缺陷 5 附带:靠英文 stderr 匹配是脆弱点,匹配不到时必须
+    /// 保守地判链不完整,而不是判完整。
+    #[test]
+    fn unparsed_backing_complaint_is_treated_as_incomplete() {
+        // 认得的措辞
+        assert!(!extract_missing("qemu-img: Could not open backing file: no such file").is_empty());
+        // 换了措辞:extract_missing 抓不到,但 stderr 提到 backing,
+        // probe 会补一条"按链不完整处理"的条目(见 probe 里的 fail-closed 分支)
+        let odd = "qemu-img: 无法打开 backing chain 的某一层";
+        assert!(odd.to_lowercase().contains("backing"));
+    }
+
+    #[test]
+    fn detach_flag_only_set_after_success() {
+        // 不真的连 NBD(纪律 3):只验状态机——已断开的对象再断一次是幂等的,
+        // 且不会去 spawn qemu-nbd。
+        let mut a = NbdAttachment {
+            device: PathBuf::from("/dev/nbd-not-real"),
+            image: PathBuf::from("/evi.qcow2"),
+            detached: true,
+        };
+        assert!(a.detach().is_ok(), "已断开时应直接返回,不重复调用 qemu-nbd");
     }
 }

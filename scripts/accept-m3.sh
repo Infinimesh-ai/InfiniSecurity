@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # M3 验收 —— 爆发检测 + 冻结/解冻 + panic 应急止损。
 #
-# 纪律自检(AGENTS.md 纪律 4:所有安全层都放行时最坏会发生什么):
+# 纪律自检(AGENTS.md 纪律 1/4:所有安全层都放行时最坏会发生什么):
 #   本脚本只删自己现造的 fixture 文件($HOME/infsec-m3-fixture-<pid> 下
-#   由脚本生成的 f*.txt),用 unlink 逐个删,不用 rm。
+#   由脚本生成的 f*.txt),用 unlink 逐个删。
+#   全脚本不含 rm / dd / mkfs / truncate / shred / git clean / find -delete。
 #   最坏结果 = 这些 fixture 文件被删,以及若干 sleep 进程被 SIGSTOP。
-#   触碰不到任何真实数据;冻结用的是 SIGSTOP(可恢复),不是 SIGKILL。
+#   删除类动作触碰不到任何真实数据;冻结用的是 SIGSTOP(可恢复),不是 SIGKILL。
+#   另外两类不删数据但会动真实状态,是验收本身需要的,都会还原:
+#   root 侧给策略加一行 fixture 路径并反复重启 infinisecd(trap 里撤销);
+#   ④ 的 infsec panic 会冻结**本机所有**被监督进程(随后 infsec thaw 解冻)
+#   ——所以这份验收必须在专用验收机上跑,别在正干活的机器上跑。
 #
 # 用法:INFSEC_SUDO_PASS=xxx ./accept-m3.sh
 
@@ -13,12 +18,16 @@ set -u
 FIX="$HOME/infsec-m3-fixture-$$"
 POLICY=/etc/infinisec/policy.toml
 AUDIT=/var/log/infinisec/audit.jsonl
-PASS=0; FAIL=0; FAILED=()
+PASS=0; FAIL=0; SKIP=0; FAILED=(); SKIPPED=()
 
 note() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
+# SKIP = 前置条件不成立,本轮没测;单独计数,绝不并进 PASS。
 chk()  {
-    if [[ $1 == PASS ]]; then printf '  \033[1;32mPASS\033[0m %s\n' "$2"; PASS=$((PASS+1));
-    else printf '  \033[1;31mFAIL\033[0m %s\n' "$2"; FAIL=$((FAIL+1)); FAILED+=("$2"); fi
+    case "$1" in
+        PASS) printf '  \033[1;32mPASS\033[0m %s\n' "$2"; PASS=$((PASS+1)) ;;
+        SKIP) printf '  \033[1;33mSKIP\033[0m %s\n' "$2"; SKIP=$((SKIP+1)); SKIPPED+=("$2") ;;
+        *)    printf '  \033[1;31mFAIL\033[0m %s\n' "$2"; FAIL=$((FAIL+1)); FAILED+=("$2") ;;
+    esac
 }
 asroot() {
     if [[ -n "${INFSEC_SUDO_PASS:-}" ]]; then echo "$INFSEC_SUDO_PASS" | sudo -S "$@" 2>/dev/null
@@ -32,7 +41,9 @@ cleanup() {
     infsec thaw >/dev/null 2>&1
     asroot sed -i "\|infsec-m3-fixture-$$|d" "$POLICY"
     asroot systemctl restart infinisecd
-    find "$FIX" -type f -exec unlink {} \; 2>/dev/null
+    # `! -type d` 而不是 `-type f`:后者匹配不到符号链接,于是链接留下来、
+    # 目录非空、rmdir 失败,fixture 就永远残留(VM 实测 M4 每跑一次留一个)。
+    find "$FIX" ! -type d -exec unlink {} \; 2>/dev/null
     find "$FIX" -depth -type d -exec rmdir {} \; 2>/dev/null
 }
 trap cleanup EXIT
@@ -76,8 +87,8 @@ for _ in $(seq 1 50); do
 done
 MS=$(( ($(date +%s%N) - T0) / 1000000 ))
 FROZEN_AFTER=$(infsec frozen 2>/dev/null | grep -c '^[0-9]' || true)
-echo "  冻结进程数: $FROZEN_AFTER,距开始 ${MS}ms"
-[[ ${FROZEN_AFTER:-0} -gt 0 ]] && chk PASS "爆发触发并冻结了进程树" || chk FAIL "未触发冻结"
+echo "  冻结进程数: $FROZEN_AFTER(开始前 ${FROZEN_BEFORE:-0}),距开始 ${MS}ms"
+[[ ${FROZEN_AFTER:-0} -gt ${FROZEN_BEFORE:-0} ]] && chk PASS "爆发触发并冻结了进程树" || chk FAIL "未触发冻结"
 # 这里量的是"从开始批量删除到冻结完成"的墙钟时间,含 60 次 syscall 判决;
 # PLAN 2.5 的 <1s 指标针对的是检测本身,这里放宽到 3s 作为端到端上界。
 [[ $MS -lt 3000 ]] && chk PASS "冻结延迟 ${MS}ms(端到端,含 60 次判决)" || chk FAIL "冻结延迟过大: ${MS}ms"
@@ -102,14 +113,19 @@ asroot grep -q 'burst-freeze' "$AUDIT" && chk PASS "冻结事件入审计" || ch
 note "② 人工解冻(SIGCONT)"
 infsec thaw 2>&1 | head -1
 sleep 0.3
-if [[ -n "${FPID:-}" ]] && [[ -e /proc/$FPID/stat ]]; then
+# 三分支:进程还在且不是 T → 解冻确实生效;仍是 T → 失败;
+# 进程不见了 → 什么都证明不了(它本该 sleep 30 秒还在),报 SKIP 不报 PASS。
+if [[ -z "${FPID:-}" ]]; then
+    chk SKIP "上一步没抓到被冻结进程,解冻一项没有可观察对象"
+elif [[ ! -e /proc/$FPID/stat ]]; then
+    chk SKIP "被冻结进程在解冻前已消失(本该还在 sleep),解冻是否生效无法判定"
+else
     STATE=$(awk '{print $3}' /proc/$FPID/stat)
     [[ $STATE != T ]] && chk PASS "解冻后进程恢复运行(状态 $STATE)" || chk FAIL "仍处于 T"
-else
-    chk PASS "进程已自行退出(解冻后)"
 fi
 kill -9 $RUNNER 2>/dev/null
-pkill -f 'sleep 30' 2>/dev/null
+# 限定本用户,别去碰别人(或别的会话)恰好也叫 sleep 30 的进程
+pkill -u "$(id -u)" -f 'sleep 30' 2>/dev/null
 wait $RUNNER 2>/dev/null
 
 # ---------- ③ 广度触发 ----------
@@ -132,7 +148,7 @@ asroot grep 'burst-freeze' "$AUDIT" | tail -1 | grep -q '顶级目录' \
     && chk PASS "审计记录了广度触发原因" || echo "  (触发原因可能是速率而非广度,两者都算有效冻结)"
 infsec thaw >/dev/null 2>&1
 kill -9 $RUNNER2 2>/dev/null
-pkill -f 'sleep 20' 2>/dev/null
+pkill -u "$(id -u)" -f 'sleep 20' 2>/dev/null
 wait $RUNNER2 2>/dev/null
 
 # ---------- ④ panic 应急止损 ----------
@@ -148,20 +164,25 @@ echo "$OUT" | grep -q '止损检查清单' && chk PASS "panic 输出止损检查
 echo "$OUT" | grep -q '隔离区' && chk PASS "清单包含隔离区优先查看步骤" || chk FAIL "清单缺隔离区步骤"
 infsec thaw >/dev/null 2>&1
 kill -9 $RUNNER3 2>/dev/null
-pkill -f 'sleep 25' 2>/dev/null
+pkill -u "$(id -u)" -f 'sleep 25' 2>/dev/null
 wait $RUNNER3 2>/dev/null
 
 # ---------- ⑤ 正常操作不误触发 ----------
 note "⑤ 对照:单项目内小批量删除不该触发冻结"
 asroot systemctl restart infinisecd; sleep 1
 for i in $(seq 1 10); do echo x > "$FIX/A/ok$i.txt"; done
-infsec run --profile interactive -- bash -c '
-for i in $(seq 1 10); do unlink '"$FIX"'/A/ok$i.txt 2>/dev/null; done' >/dev/null 2>&1
-sleep 0.5
-NF=$(infsec frozen 2>/dev/null | grep -c '^[0-9]' || true)
-[[ ${NF:-0} -eq 0 ]] && chk PASS "10 个文件的正常删除未触发冻结" || chk FAIL "误触发冻结"
+# 被监督进程没跑起来的话,"没有冻结"什么也证明不了 —— 那种情况报 SKIP。
+if infsec run --profile interactive -- bash -c '
+for i in $(seq 1 10); do unlink '"$FIX"'/A/ok$i.txt 2>/dev/null; done' >/dev/null 2>&1; then
+    sleep 0.5
+    NF=$(infsec frozen 2>/dev/null | grep -c '^[0-9]' || true)
+    [[ ${NF:-0} -eq 0 ]] && chk PASS "10 个文件的正常删除未触发冻结" || chk FAIL "误触发冻结"
+else
+    chk SKIP "被监督进程未能启动(daemon 不可达?),误触发对照项未测"
+fi
 
 note "结果"
-printf '\033[1;32m%d PASS\033[0m / \033[1;31m%d FAIL\033[0m\n' "$PASS" "$FAIL"
-[[ $FAIL -gt 0 ]] && printf '失败项:\n' && printf '  - %s\n' "${FAILED[@]}"
+printf '\033[1;32m%d PASS\033[0m / \033[1;31m%d FAIL\033[0m / \033[1;33m%d SKIP\033[0m(SKIP 不计入 PASS)\n' "$PASS" "$FAIL" "$SKIP"
+if [[ $SKIP -gt 0 ]]; then printf '跳过项(本轮未覆盖,需人工判断能否接受):\n'; printf '  - %s\n' "${SKIPPED[@]}"; fi
+if [[ $FAIL -gt 0 ]]; then printf '失败项:\n'; printf '  - %s\n' "${FAILED[@]}"; fi
 [[ $FAIL -eq 0 ]]

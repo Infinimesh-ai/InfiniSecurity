@@ -19,6 +19,14 @@ RemainAfterExit=yes
 ExecStartPre=/bin/sh -c 'grep -q bpf /sys/kernel/security/lsm || { echo "内核未启用 bpf LSM(内核参数需含 lsm=...,bpf)"; exit 1; }'
 ExecStartPre=/bin/mkdir -p /sys/fs/bpf/infsec
 ExecStart=/usr/local/bin/infsec-lsm-load
+# 重新加载会建出**全新清零的 map**:enabled=0(observe,内核层什么都不拦)、
+# protected_prefixes 全零、exempt_pid=0。而写策略进 map 的
+# sync_prefixes/set_config 只在 infinisecd **启动时**跑一次(没有 SIGHUP、
+# 没有周期重同步)。所以单独 `systemctl restart infinisec-lsm` 会让内核层
+# 静默解除武装,直到有人恰好也重启了 infinisecd——一个"重启了防护组件反而
+# 没了防护"的陷阱,而且从外部完全看不出来。
+# 用 --no-block 避免与本单元的 Before=infinisecd.service 顺序关系死锁。
+ExecStartPost=-/usr/bin/systemctl --no-block try-restart infinisecd.service
 ExecStop=/bin/sh -c 'rm -rf /sys/fs/bpf/infsec'
 
 [Install]

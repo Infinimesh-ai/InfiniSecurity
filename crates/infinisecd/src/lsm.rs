@@ -172,13 +172,23 @@ pub fn set_config(enforce: bool, exempt_pid: u32) -> Result<()> {
     Ok(())
 }
 
-/// 读回计数:(检查次数, 拒绝次数)。
-pub fn stats() -> Result<(u64, u64)> {
+/// 读回计数:(检查次数, 拒绝次数, 路径解析失败次数)。
+///
+/// 第三个数存在的理由:`bpf_d_path` 放不下路径时返回负数,内核侧只能
+/// 放行(fail-open)。这种漏保护不会有任何外在表现——只会看起来像
+/// "没触发过"。把它显式记出来,免得少保护了还以为一切正常。
+pub fn stats() -> Result<(u64, u64, Option<u64>)> {
     let fd = map_get("stats").context("读取 LSM 统计失败")?;
     let checked = map_lookup_u64(fd, 0)?;
     let denied = map_lookup_u64(fd, 1)?;
+    // 第三项读不到 = 内核里跑的还是**旧程序**(旧 stats map 只有两项,
+    // key 2 越界返回 ENOENT)。绝不能 unwrap_or(0):那会把"还没换程序"
+    // 伪装成"新程序 + 零次解析失败",而这一项恰恰是唯一能暴露
+    // "PATH_LEN 还是 256、超长路径仍在 fail-open"的信号。
+    // 用 None 如实表示"这个信号不可用"。
+    let unresolved = map_lookup_u64(fd, 2).ok();
     unsafe { libc::close(fd) };
-    Ok((checked, denied))
+    Ok((checked, denied, unresolved))
 }
 
 /// 给 `infsec lsm status` 的人读摘要。
@@ -202,8 +212,22 @@ pub fn status_lines() -> Vec<String> {
     }
     out.push(format!("LSM 程序已加载,pin 于 {PIN_DIR}"));
     match stats() {
-        Ok((checked, denied)) => {
+        Ok((checked, denied, unresolved)) => {
             out.push(format!("已检查 {checked} 次删除,拒绝 {denied} 次"));
+            match unresolved {
+                None => out.push(
+                    "⚠ 读不到「路径解析失败」计数:内核里跑的是**加固前的旧程序**。\
+                     它的路径缓冲只有 256 字节,超过就静默放行且无任何记录。\
+                     请重新加载:systemctl restart infinisec-lsm && \
+                     systemctl restart infinisecd(两个都要重启,顺序不能颠倒)"
+                        .into(),
+                ),
+                Some(n) if n > 0 => out.push(format!(
+                    "⚠ 有 {n} 次删除因路径解析不出而未被内核层检查\
+                     (fail-open)。这不是「没事发生」,是「没看见」。"
+                )),
+                Some(_) => {}
+            }
         }
         Err(e) => out.push(format!("统计读取失败: {e}")),
     }

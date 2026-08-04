@@ -2,15 +2,20 @@
 # M2 验收 —— 风险分级 + 二审通道 + 合并判决 + 隔离区。
 # 在验收虚拟机里以【被监督普通用户】身份运行。
 #
-# 纪律自检(AGENTS.md 纪律 4:所有安全层都放行时最坏会发生什么):
+# 纪律自检(AGENTS.md 纪律 1/4:所有安全层都放行时最坏会发生什么):
 #   本脚本只对**自己现造的 fixture 仓库**做 unlink;fixture 建在
 #   $HOME/infsec-m2-fixture-<pid> 下,内容是脚本自己写的几行文本。
-#   全脚本不含 rm / dd / mkfs / find -delete 之外的破坏性命令,
-#   唯一的 find -delete 作用于 fixture 里现造的 bulk/ 目录(用于验证
-#   合并判决),且该目录只含脚本刚生成的 f*.txt。
-#   最坏结果 = 这些 fixture 文件被删。触碰不到任何真实数据。
+#   全脚本不含 rm / dd / mkfs / truncate / shred / git clean / find -delete。
+#   ⑦ 的 300 文件批量删除**不用 find -delete**(纪律 1 点名的真实弹药):
+#   改成只认脚本自己造的那 300 个绝对文件名的循环——没有递归、没有通配、
+#   没有相对路径,判决路径与逐个 unlink 完全一致。
+#   最坏结果 = 这些 fixture 文件被删。删除类动作触碰不到任何真实数据。
 #   清理只用 unlink/rmdir,绝不用 rm -rf(变量为空时 rm -rf 会毁掉家目录,
 #   这正是本项目诞生的那类事故)。
+#   root 侧会改真实配置(给策略加一行 fixture 路径;⑦ 期间把爆发阈值
+#   max_files 从 50 临时抬到 5000 以便单独度量合并判决),并反复重启
+#   infinisecd。两处都由 trap cleanup 还原——**含中途失败的情况**,
+#   因为阈值没还原等于验收自己把爆发检测调松了。它们改配置,不删数据。
 #
 # 用法:INFSEC_SUDO_PASS=xxx ./accept-m2.sh
 
@@ -40,7 +45,9 @@ cleanup() {
     asroot sed -i 's/^max_files = 5000/max_files = 50/' "$POLICY"
     asroot systemctl restart infinisecd
     # 只用 unlink/rmdir 清理(纪律 1)
-    find "$FIX" -type f -exec unlink {} \; 2>/dev/null
+    # `! -type d` 而不是 `-type f`:后者匹配不到符号链接,于是链接留下来、
+    # 目录非空、rmdir 失败,fixture 就永远残留(VM 实测 M4 每跑一次留一个)。
+    find "$FIX" ! -type d -exec unlink {} \; 2>/dev/null
     find "$FIX" -depth -type d -exec rmdir {} \; 2>/dev/null
 }
 trap cleanup EXIT
@@ -157,9 +164,19 @@ asroot systemctl restart infinisecd; sleep 1
 CACHED_BEFORE=$(asroot grep -c 'cached-grant' "$AUDIT" 2>/dev/null | tr -d '[:space:]')
 CACHED_BEFORE=${CACHED_BEFORE:-0}
 T0=$(date +%s%N)
-infsec run --profile interactive -- /usr/bin/find bulk -type f -delete >/dev/null 2>&1
+# 纪律 1:批量删除不借道 find -delete。这段只会碰到脚本自己刚造的
+# bulk/f1..f300.txt,路径逐个写死,删不到别的东西;被拒时继续往下试,
+# 这样"合并判决命中多少次"才量得准。
+infsec run --profile interactive -- python3 -c "
+import os
+for i in range(1, 301):
+    try:
+        os.unlink('$FIX/withremote/bulk/f%d.txt' % i)
+    except OSError:
+        pass
+" >/dev/null 2>&1
 MS=$(( ($(date +%s%N) - T0) / 1000000 ))
-LEFT=$(find bulk -type f 2>/dev/null | wc -l)
+LEFT=$(find "$FIX/withremote/bulk" -type f 2>/dev/null | wc -l)
 CACHED_AFTER=$(asroot grep -c 'cached-grant' "$AUDIT" 2>/dev/null | tr -d '[:space:]')
 CACHED_AFTER=${CACHED_AFTER:-0}
 CACHED=$(( CACHED_AFTER - CACHED_BEFORE ))

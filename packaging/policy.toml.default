@@ -18,6 +18,11 @@ paths = [
     "/etc/infinisec",
     "/var/log/infinisec",
     "/var/lib/infinisec",
+    # 隔离区与快照仓库。它原先只出现在下面的 lsm_absolute 里,
+    # 于是 seccomp 层根本不认它:`mv ~/.infinisec ~/gone` 两层都不拦,
+    # 而 `infsec lsm status` 和 install-vm.sh 都在宣称"全系统任何进程
+    # 都删不掉隔离区/快照"。放行的删除能不能找回全靠这个目录。
+    "@SUPERVISED_HOME@/.infinisec",
 ]
 # 任意位置的 .git 目录(仓库历史,事故中最痛的损失)
 git_dirs = true

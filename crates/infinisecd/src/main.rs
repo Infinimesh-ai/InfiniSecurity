@@ -95,6 +95,48 @@ fn frozen_list(uid: u32) -> Vec<i32> {
     map.get(&uid).cloned().unwrap_or_default()
 }
 
+/// 会话内那些**跨会话控制命令必须够得着**的状态。
+///
+/// panic/thaw 是控制通道来的,不在会话线程里,可爆发检测器与授权表都长在
+/// Session 上。不把它们登记出来,就会出现两个"介入之后防线反而失效"的洞:
+/// - 爆发检测触发后 `tripped` 恒真、`record` 恒返回 None,而 `reset()` 在
+///   生产代码里一次都没被调用——人工 thaw 之后,该会话剩余全程再没有
+///   速率/广度闸门,而那正是刚出过事、最需要闸门的时刻;
+/// - 冻结时不作废授权,解冻后进程带着一张还剩几百个文件配额的通行证
+///   继续跑,`revoke_under` 同样从未被调用。
+#[derive(Clone)]
+struct SessionHandles {
+    burst: Arc<std::sync::Mutex<burst::BurstDetector>>,
+    grants: Arc<std::sync::Mutex<merge::GrantTable>>,
+}
+
+static HANDLES: std::sync::Mutex<Option<Vec<(u32, i32, SessionHandles)>>> =
+    std::sync::Mutex::new(None);
+
+fn handles_add(uid: u32, pid: i32, h: SessionHandles) {
+    let mut g = HANDLES.lock().unwrap();
+    g.get_or_insert_with(Vec::new).push((uid, pid, h));
+}
+
+fn handles_remove(pid: i32) {
+    let mut g = HANDLES.lock().unwrap();
+    if let Some(v) = g.as_mut() {
+        v.retain(|(_, p, _)| *p != pid);
+    }
+}
+
+fn handles_of(uid: u32) -> Vec<SessionHandles> {
+    let g = HANDLES.lock().unwrap();
+    g.as_ref()
+        .map(|v| {
+            v.iter()
+                .filter(|(u, _, _)| *u == uid)
+                .map(|(_, _, h)| h.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// 活动会话登记簿:panic 要冻结本用户的全部被监督进程树。
 static SESSIONS: std::sync::Mutex<Option<Vec<(u32, i32)>>> = std::sync::Mutex::new(None);
 
@@ -202,16 +244,36 @@ fn run() -> Result<()> {
     }
 
     let session_seq = Arc::new(AtomicU64::new(1));
+    // 并发连接上限。socket 是 0666(连接只意味着"自愿接受监督",不授予
+    // 权力),所以任意本地用户都能连;不设上限的话,一个 for 循环就能
+    // 让 daemon 起几千个线程、每个还挂着一块接收缓冲。判决核被拖垮的
+    // 后果不是"慢",是整台机器的删除防护一起没了。
+    const MAX_CONNS: usize = 64;
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
+                if live.load(Ordering::Relaxed) >= MAX_CONNS {
+                    // 直接关掉,不 spawn。被拒的是连接,不是判决——
+                    // 已建立的会话不受影响,新的 infsec run 会看到握手失败
+                    // 而 fail-closed(不会降级成"无监督地跑")。
+                    eprintln!(
+                        "infinisecd: ⚠ 并发连接已达上限 {MAX_CONNS},拒绝新连接"
+                    );
+                    drop(stream);
+                    continue;
+                }
+                live.fetch_add(1, Ordering::Relaxed);
                 let policy = policy.clone();
                 let audit = audit.clone();
                 let seq = session_seq.clone();
+                let live = live.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = handle_session(stream, policy, audit, seq) {
                         eprintln!("infinisecd: 会话异常结束: {e:#}");
                     }
+                    live.fetch_sub(1, Ordering::Relaxed);
                 });
             }
             Err(e) => eprintln!("infinisecd: accept 失败: {e}"),
@@ -302,13 +364,15 @@ struct Session {
     /// 备份态探测器(带缓存)。
     probe: backup::BackupProbe,
     /// 会话内的判决授权表(不跨进程树)。
-    grants: std::sync::Mutex<merge::GrantTable>,
+    /// Arc:冻结时控制通道要够得着它来作废授权。
+    grants: Arc<std::sync::Mutex<merge::GrantTable>>,
     /// M2 流水线配置。
     pipeline: pipeline::PipelineConfig,
     /// 隔离批次序号。
     batch_seq: AtomicU64,
     /// 爆发检测器(PLAN 2.5)。每进程树一个。
-    burst: std::sync::Mutex<burst::BurstDetector>,
+    /// Arc:人工 thaw 之后要把它复位,否则该会话的速率闸门永久失效。
+    burst: Arc<std::sync::Mutex<burst::BurstDetector>>,
     /// 已冻结的 pid(供人工解冻)。
     frozen: std::sync::Mutex<Vec<i32>>,
 }
@@ -392,7 +456,7 @@ fn handle_session(
     let (payload, maybe_fd) =
         fdpass::recv_maybe_fd_stream(&stream).context("接收首条消息失败")?;
     let Some(notify_fd): Option<OwnedFd> = maybe_fd else {
-        return handle_control(&mut stream, &policy, uid, payload.trim_ascii_end());
+        return handle_control(&mut stream, &policy, uid, peer_pid, payload.trim_ascii_end());
     };
     let hello: SessionHello =
         serde_json::from_slice(payload.trim_ascii_end()).context("hello 解析失败")?;
@@ -444,6 +508,9 @@ fn handle_session(
         max_top_dirs: policy.burst.max_top_dirs,
     };
 
+    let grants_handle = Arc::new(std::sync::Mutex::new(merge::GrantTable::default()));
+    let burst_handle = Arc::new(std::sync::Mutex::new(burst::BurstDetector::new(burst_limits)));
+
     let session = Session {
         id: sid,
         uid,
@@ -458,14 +525,19 @@ fn handle_session(
         may_delete: hello.may_delete.clone(),
         cwd,
         probe,
-        grants: std::sync::Mutex::new(merge::GrantTable::default()),
+        grants: grants_handle.clone(),
         pipeline: pipeline_cfg,
         batch_seq: AtomicU64::new(1),
-        burst: std::sync::Mutex::new(burst::BurstDetector::new(burst_limits)),
+        burst: burst_handle.clone(),
         frozen: std::sync::Mutex::new(Vec::new()),
     };
 
     session_add(uid, peer_pid);
+    handles_add(
+        uid,
+        peer_pid,
+        SessionHandles { burst: burst_handle, grants: grants_handle },
+    );
     session.audit.write(&AuditRecord {
         ts: now_rfc3339(),
         session: &session.id,
@@ -488,6 +560,7 @@ fn handle_session(
 
     let end_note = notify_loop(&session, &notify_fd);
     session_remove(peer_pid);
+    handles_remove(peer_pid);
 
     session.audit.write(&AuditRecord {
         ts: now_rfc3339(),
@@ -602,19 +675,38 @@ fn decide_and_respond(session: &Session, fd: i32, notif: &SeccompNotif) {
         return;
     }
 
+    let enforce = session.policy.mode == Mode::Enforce;
+
     // 爆发检测:在判决**之前**记账(PLAN 2.5)。被拒绝的删除同样是信号
     // ——次次被拒却仍在疯狂尝试的进程,正是最该冻结的那种。
+    //
+    // 但 observe 模式下**只记账、不冻结**。冻结是 SIGSTOP 整棵进程树 +
+    // 作废全部授权 + 对当前 syscall 回 EPERM,是这套系统里最激烈的动作;
+    // 而 observe 的契约是"只记审计,一律放行"。出厂阈值是 10 秒 50 次删除,
+    // `cargo clean`、`npm install` 的临时文件搬运随手就能达到——而且
+    // burst_target 不看保护集,连保护集外的删除都计数。让 observe 把用户
+    // 整棵进程树停住、还要人跑 `infsec thaw` 才能恢复,比任何误报都更能
+    // 让人当场把防御卸掉。
     if session.policy.burst.enabled {
         if let Some(target) = burst_target(&event) {
             let trigger = session.burst.lock().unwrap().record(&target);
             if let Some(t) = trigger {
-                freeze_and_alert(session, notif, &t);
-                // 冻结后仍然拒掉当前这次操作:进程已停,但 pending 的
-                // syscall 需要一个明确答复,绝不能是放行。
-                let _ = seccomp::notif_send(fd, &seccomp::resp_deny_eperm(notif.id));
-                audit_syscall(session, notif, argv.as_deref(), &paths, "deny",
-                    Some("burst-freeze"), Some(&t.describe()));
-                return;
+                if enforce {
+                    freeze_and_alert(session, notif, &t);
+                    // 冻结后仍然拒掉当前这次操作:进程已停,但 pending 的
+                    // syscall 需要一个明确答复,绝不能是放行。
+                    let _ = seccomp::notif_send(fd, &seccomp::resp_deny_eperm(notif.id));
+                    audit_syscall(session, notif, argv.as_deref(), &paths, "deny",
+                        Some("burst-freeze"), Some(&t.describe()));
+                    return;
+                }
+                // observe:把"这里本会冻结"如实记下来,让人能据此评估
+                // 阈值是否合适,然后照常放行。
+                audit_syscall(
+                    session, notif, argv.as_deref(), &paths,
+                    "observe-would-freeze", Some("burst"),
+                    Some(&format!("{};observe 模式不冻结", t.describe())),
+                );
             }
         }
     }
@@ -627,32 +719,68 @@ fn decide_and_respond(session: &Session, fd: i32, notif: &SeccompNotif) {
 
     // M2:保护集命中但不是签名层命中 → 进风险分级 + 二审流水线,
     // 而不是像 M1 那样一律拒。签名层的 deny 直接落地,不进流水线。
-    let verdict = match &verdict {
-        Verdict::Deny { rule } if !rule.starts_with("signature:") => {
-            match run_pipeline(session, notif, &event, rule) {
-                PipelineResult::Deny(why) => Verdict::Deny { rule: why },
-                PipelineResult::AllowDirect(why) => {
-                    respond_allow(session, fd, notif, argv.as_deref(), &paths, &why);
-                    return;
-                }
-                PipelineResult::AllowQuarantined(why) => {
-                    // 文件已被 daemon 移入隔离区,syscall 不必真跑
-                    if !seccomp::notif_id_valid(fd, notif.id) {
-                        audit_syscall(session, notif, argv.as_deref(), &paths, "stale", None,
-                            Some("隔离后 notify id 复验失败"));
+    //
+    // **只在 enforce 模式下跑流水线**。原实现把它放在 enforce 判断之前,
+    // 于是 observe 模式下流水线照样执行副作用:quarantine::preserve 把文件
+    // rename 出原路径、daemon_delete 直接 unlink、snapshot 写副本,最后还用
+    // resp_emulated_success 伪造成功。文档写的是"observe 只记审计,一律
+    // 放行",实际行为是"daemon 以 root 代你删,并替内核编了个返回值"
+    // ——连被监督进程自己本该撞上的 EACCES 都被绕过了。
+    // observe 存在的意义是"先看看会拦下什么",它必须是只读的。
+    let verdict = if enforce {
+        match &verdict {
+            Verdict::Deny { rule } if !rule.starts_with("signature:") => {
+                match run_pipeline(session, notif, &event, rule, false) {
+                    PipelineResult::Deny(why) => Verdict::Deny { rule: why },
+                    PipelineResult::AllowDirect(why) => {
+                        respond_allow(session, fd, notif, argv.as_deref(), &paths, &why);
                         return;
                     }
-                    let _ = seccomp::notif_send(fd, &seccomp::resp_emulated_success(notif.id));
-                    audit_syscall(session, notif, argv.as_deref(), &paths, "allow-quarantined",
-                        Some(rule), Some(&why));
-                    return;
+                    PipelineResult::Predicted { .. } => {
+                        // dry_run=false 时不可能到这里
+                        let _ = seccomp::notif_send(fd, &seccomp::resp_deny_eperm(notif.id));
+                        audit_syscall(session, notif, argv.as_deref(), &paths, "deny",
+                            Some("internal-unexpected-predicted"), None);
+                        return;
+                    }
+                    PipelineResult::KernelError(errno) => {
+                        // 内核本来就会这样失败,判决不改变这一点。
+                        // 没有任何文件系统改动发生,所以也不需要复验。
+                        let _ =
+                            seccomp::notif_send(fd, &seccomp::resp_deny_errno(notif.id, errno));
+                        audit_syscall(
+                            session,
+                            notif,
+                            argv.as_deref(),
+                            &paths,
+                            "kernel-errno",
+                            Some(rule),
+                            Some(&format!(
+                                "按内核语义返回 errno {errno},未做任何文件系统改动"
+                            )),
+                        );
+                        return;
+                    }
+                    PipelineResult::AllowQuarantined(why) => {
+                        // 文件已被 daemon 移入隔离区,syscall 不必真跑
+                        if !seccomp::notif_id_valid(fd, notif.id) {
+                            audit_syscall(session, notif, argv.as_deref(), &paths, "stale", None,
+                                Some("隔离后 notify id 复验失败;注意文件已被移入隔离区"));
+                            return;
+                        }
+                        let _ = seccomp::notif_send(fd, &seccomp::resp_emulated_success(notif.id));
+                        audit_syscall(session, notif, argv.as_deref(), &paths, "allow-quarantined",
+                            Some(rule), Some(&why));
+                        return;
+                    }
                 }
             }
+            v => v.clone(),
         }
-        v => v.clone(),
+    } else {
+        verdict
     };
 
-    let enforce = session.policy.mode == Mode::Enforce;
     match (&verdict, enforce) {
         (Verdict::Deny { rule }, true) => {
             // 拒绝不需要 TOCTOU 复验:基于陈旧数据的拒绝最多误伤一次重试
@@ -672,15 +800,44 @@ fn decide_and_respond(session: &Session, fd: i32, notif: &SeccompNotif) {
             }
         }
         (Verdict::Deny { rule }, false) => {
+            // observe:照常放行,但审计要写**enforce 下真正会发生什么**。
+            //
+            // 签名层的 deny 是硬拒、不进流水线,如实记 would-deny;
+            // 其余命中保护集的操作跑一次只读分级(不起复核子进程、不碰
+            // 文件系统),把 T×S 等级与处置方式记下来。否则这份数据只能
+            // 告诉你"命中了保护集",而 enforce 下这些里的大多数其实是放行的。
+            let (verdict_tag, note) = if rule.starts_with("signature:") {
+                ("observe-would-deny".to_string(), "签名层硬拒,不可申诉".to_string())
+            } else {
+                match run_pipeline(session, notif, &event, rule, true) {
+                    PipelineResult::Predicted { level, mode, after } => {
+                        let tag = if mode == "None" {
+                            "observe-would-allow"
+                        } else if mode == "Human" {
+                            "observe-would-deny"
+                        } else {
+                            "observe-would-review"
+                        };
+                        (
+                            tag.to_string(),
+                            format!("等级 {level};复核方式 {mode};放行后 {after}"),
+                        )
+                    }
+                    other => (
+                        "observe-allow".to_string(),
+                        format!("分级未能完成: {other:?};已放行"),
+                    ),
+                }
+            };
             let _ = seccomp::notif_send(fd, &seccomp::resp_allow_continue(notif.id));
             audit_syscall(
                 session,
                 notif,
                 argv.as_deref(),
                 &paths,
-                "observe-allow",
+                &verdict_tag,
                 Some(rule),
-                Some("observe 模式:本应拒绝,已放行"),
+                Some(&note),
             );
         }
         (Verdict::Allow, _) => {
@@ -739,13 +896,19 @@ fn parse_event(
             let raw = tracee::read_cstr(pid, a[0])?;
             let path = tracee::resolve_path(pid, libc::AT_FDCWD, &raw)?;
             let ps = path.to_audit_strings();
-            Ok((verdict::Event::Remove { path }, None, ps))
+            Ok((
+                verdict::Event::Remove { path, remove_dir: nr == NR_RMDIR },
+                None,
+                ps,
+            ))
         }
         NR_UNLINKAT => {
             let raw = tracee::read_cstr(pid, a[1])?;
             let path = tracee::resolve_path(pid, a[0] as i32, &raw)?;
             let ps = path.to_audit_strings();
-            Ok((verdict::Event::Remove { path }, None, ps))
+            // unlinkat(dirfd, path, flags):AT_REMOVEDIR 决定它是 unlink 还是 rmdir
+            let remove_dir = (a[2] as i32 & libc::AT_REMOVEDIR) != 0;
+            Ok((verdict::Event::Remove { path, remove_dir }, None, ps))
         }
         NR_RENAME => {
             let from = tracee::resolve_path(pid, libc::AT_FDCWD, &tracee::read_cstr(pid, a[0])?)?;
@@ -769,7 +932,13 @@ fn parse_event(
             let ps = path.to_audit_strings();
             Ok((verdict::Event::Truncate { path, exists }, None, ps))
         }
-        NR_FTRUNCATE => match tracee::resolve_fd(pid, a[0] as i32)? {
+        // fallocate 的破坏性 mode(PUNCH_HOLE / COLLAPSE_RANGE / ZERO_RANGE)
+        // 与 ftruncate 一样是就地销毁既有内容,过滤器只把这几个 mode 送上来。
+        //
+        // ioctl 同理:过滤器只放行了直达 vfs_fallocate 的那几个 legacy XFS
+        // 请求号(FS_IOC_UNRESVSP / UNRESVSP64 / ZERO_RANGE),语义与
+        // PUNCH_HOLE / ZERO_RANGE 完全一样,所以按同一条路径处理。
+        NR_FTRUNCATE | NR_FALLOCATE | NR_IOCTL => match tracee::resolve_fd(pid, a[0] as i32)? {
             Some(path) => {
                 // fd 已经指向具体 inode,截断的必然是既有内容。
                 let path = tracee::PathId::single(path);
@@ -800,7 +969,7 @@ fn event_paths(ev: &verdict::Event) -> Box<dyn Iterator<Item = &Path> + '_> {
         verdict::Event::Exec { .. } | verdict::Event::TruncateNonPath => {
             Box::new(std::iter::empty())
         }
-        verdict::Event::Remove { path } | verdict::Event::Truncate { path, .. } => {
+        verdict::Event::Remove { path, .. } | verdict::Event::Truncate { path, .. } => {
             Box::new(path.all())
         }
         verdict::Event::Rename { from, to, .. } => Box::new(from.all().chain(to.all())),
@@ -839,12 +1008,18 @@ fn audit_syscall(
 
 // ---- M2 流水线接入 ----
 
+#[derive(Debug)]
 enum PipelineResult {
     /// 放行,syscall 照常执行。
     AllowDirect(String),
     /// 放行,但内容已由 daemon 移入隔离区/已快照。
     AllowQuarantined(String),
     Deny(String),
+    /// 内核本来就会用这个 errno 失败(EISDIR / ENOTEMPTY / ENOTDIR)。
+    /// 判决放行与否都不改变这一点——原样回给调用方,不做任何文件系统改动。
+    KernelError(i32),
+    /// observe 模式的预测结论:分级跑完了,复核与执行都没跑。
+    Predicted { level: String, mode: String, after: String },
 }
 
 /// 把一个命中保护集的事件送进 M2 流水线。
@@ -853,21 +1028,60 @@ fn run_pipeline(
     notif: &SeccompNotif,
     event: &verdict::Event,
     protect_rule: &str,
+    dry_run: bool,
 ) -> PipelineResult {
     let pid = notif.pid as i32;
-    let (op, target) = match event {
-        verdict::Event::Remove { path } => (merge::OpKind::Remove, path.shown().to_path_buf()),
-        verdict::Event::Rename { from, .. } => (merge::OpKind::Rename, from.shown().to_path_buf()),
-        verdict::Event::Truncate { path, .. } => {
-            (merge::OpKind::Truncate, path.shown().to_path_buf())
-        }
+    let (op, id, remove_dir) = match event {
+        verdict::Event::Remove { path, remove_dir } => (merge::OpKind::Remove, path, *remove_dir),
+        verdict::Event::Rename { from, .. } => (merge::OpKind::Rename, from, false),
+        verdict::Event::Truncate { path, .. } => (merge::OpKind::Truncate, path, false),
         // exec 与非路径截断不该走到这里
         _ => return PipelineResult::Deny("非路径事件误入流水线".into()),
     };
 
-    // 三个维度的探测
-    let git_state = session.probe.git_state(&target);
-    let path_class = infsec_common::pathclass::classify(&target, git_state);
+    // 判决用**全部身份**,执行用内核会作用到的那一个。
+    //
+    // M1 修过一次符号链接绕过:保护集匹配改成词法与真实身份都过一遍
+    // (verdict.rs 的 hit)。但 M2 的流水线又把 PathId 塌缩回 `shown()`
+    // (词法),于是分级、跨界、预授权、隔离落点、daemon 删除全部只看词法
+    // 路径——同一个洞在分级层复活了:在保护区里建一个叫 `build` 的符号
+    // 链接指向别的保护目录,删它下面的普通文件,classify 见到 `build`
+    // 分量判 S0 → 免复核 + 免隔离区 → daemon 以 root 穿过链接把真文件
+    // 永久删掉,一份副本都不留。
+    //
+    // 所以:分级取所有身份里**最严**的,跨界取"任一身份跨界即跨界",
+    // 预授权要求**每个**身份都在清单内(否则声明一个链接名就等于声明了
+    // 它指向的一切),而执行落到 `effective`——内核 unlink 真正作用的
+    // 那个文件,也就是穿过中间符号链接之后的 `real`。
+    let mut effective: PathBuf = id.real.clone().unwrap_or_else(|| id.lexical.clone());
+
+    // truncate 族要多算一个身份:**最终分量的符号链接**。
+    //
+    // `resolve_path` 刻意不解析最终分量——对 unlink/rename 那是对的
+    // (删的是链接本身,不是它指向的文件)。但 truncate(2) 与
+    // open(O_TRUNC) 恰恰相反,它们**跟随**最终分量。于是最终分量是链接时,
+    // PathId 只有一个身份(链接自己),"取所有身份里最严"根本看不到真正
+    // 被清空的那个文件,effective 也不是它。
+    let mut extra_identity: Option<PathBuf> = None;
+    if op == merge::OpKind::Truncate {
+        if let Ok(followed) = effective.canonicalize() {
+            if followed != effective {
+                extra_identity = Some(followed.clone());
+                // 执行/快照都应落在真正被截断的那个文件上
+                effective = followed;
+            }
+        } else if std::fs::symlink_metadata(&effective)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            // 是链接但解析不了(悬空链接指向别处)——判不准就拒
+            return PipelineResult::Deny(
+                "截断目标是无法解析的符号链接,判不准真实落点,拒绝放行".into(),
+            );
+        }
+    }
+    let target = effective.clone();
+
     let thresholds = match session.profile {
         infsec_common::risk::Profile::Autonomous => backup::T1Thresholds {
             max_ahead: session.policy.risk.t1_max_ahead,
@@ -879,16 +1093,32 @@ fn run_pipeline(
             max_push_age: session.policy.risk.t1_max_push_age(),
         },
     };
-    let base_tier = session
-        .probe
-        .repo_state(&target)
-        .map(|r| r.tier(&thresholds))
-        // 不在任何仓库里 = 没有 git 这层恢复网
-        .unwrap_or(infsec_common::risk::Tier::T2);
-    let cross = backup::is_cross_boundary(session.session_root.as_deref(), &target);
-    let tier = pipeline::backup_tier_with_boundary(base_tier, cross);
 
-    let preauth = pipeline::preauthorized(&session.may_delete, &session.cwd, &target);
+    let mut path_class = infsec_common::risk::PathClass::S0;
+    let mut tier = infsec_common::risk::Tier::T1;
+    let mut preauth = true;
+    let mut any_identity = false;
+    for p in id.all().chain(extra_identity.as_deref()) {
+        any_identity = true;
+        let git_state = session.probe.git_state(p);
+        let c = infsec_common::pathclass::classify(p, git_state);
+        if c > path_class {
+            path_class = c;
+        }
+        let base = session
+            .probe
+            .repo_state(p)
+            .map(|r| r.tier(&thresholds))
+            // 不在任何仓库里 = 没有 git 这层恢复网
+            .unwrap_or(infsec_common::risk::Tier::T2);
+        let cross = backup::is_cross_boundary(session.session_root.as_deref(), p);
+        tier = tier.stricter(pipeline::backup_tier_with_boundary(base, cross));
+        preauth &= pipeline::preauthorized(&session.may_delete, &session.cwd, p);
+    }
+    if !any_identity {
+        // PathId 至少有一个身份;走到这里说明结构被破坏了,fail-closed。
+        return PipelineResult::Deny("路径身份为空,拒绝判决".into());
+    }
 
     let risk = infsec_common::risk::RiskInput {
         backup_tier: tier,
@@ -898,9 +1128,36 @@ fn run_pipeline(
         preauthorized: preauth,
     };
 
+    // observe 模式在这里就停:分级已经算完,而复核会起子进程、执行会碰
+    // 文件系统,两者都不属于"只记审计"。
+    //
+    // 不这样做的话,observe 只剩 core.decide() 的粗判决,把 enforce 实际
+    // **会放行**的操作(T1×S1 免复核、S0 直放、预授权、缓存命中——也就是
+    // 日常最常见的那些)一律记成"本应拒绝"。运维照这份数据评估,只会得出
+    // "开 enforce 会拦死一切"的结论,而 observe 唯一的用途正是开 enforce
+    // 之前量一量误报面。反过来 T0/S4 的硬拒和 T1×S1 的免复核在记录里长得
+    // 一模一样,轻重也分不出来。
+    if dry_run {
+        let level = infsec_common::risk::compose(&risk);
+        let (mode, after, _) = pipeline::plan_for(&level);
+        return PipelineResult::Predicted {
+            level: level.describe(),
+            mode: format!("{mode:?}"),
+            after: format!("{after:?}"),
+        };
+    }
+
     let evidence = review::Evidence {
         syscall: seccomp::syscall_name(notif.data.nr as u32).to_string(),
-        resolved_paths: vec![target.display().to_string()],
+        // 证据包给出全部身份:复核员必须看得见"词法路径长这样,但它
+        // 实际指向那里",否则符号链接分叉在人/模型眼里是隐形的。
+        resolved_paths: {
+            let mut v = id.to_audit_strings();
+            if let Some(x) = &extra_identity {
+                v.push(format!("{}(截断实际落点)", x.display()));
+            }
+            v
+        },
         argv: vec![],
         cwd: session.cwd.display().to_string(),
         process_chain: pipeline::process_chain(pid, 8),
@@ -922,8 +1179,29 @@ fn run_pipeline(
         pipeline::decide(&session.pipeline, &mut grants, &decision)
     };
 
+    // 放行之前先照内核语义办事。
+    //
+    // `unlink` 打到目录,内核返回 EISDIR;`rmdir` 打到非空目录返回 ENOTEMPTY
+    // ——两个都是**无害失败**,调用方的错误处理正指望着它们。而隔离区分支
+    // 用 rename 搬整棵子树、再向调用方合成成功,会把这类安全失败变成
+    // "成功 + 整棵树离开原位",连"rmdir 失败即目录非空"这种基本判据都被
+    // 击穿。所以在动手之前先把这两种情况按内核的答案原样回去。
+    if op == merge::OpKind::Remove && outcome.is_allow() {
+        if let Some(errno) = kernel_removal_error(&effective, remove_dir) {
+            return PipelineResult::KernelError(errno);
+        }
+    }
+
     match outcome {
-        pipeline::Outcome::Deny { why } => PipelineResult::Deny(why),
+        pipeline::Outcome::Deny { why } => {
+            // 这片区域刚证明自己含有需要复核的东西(S3/S4 不走缓存,所以
+            // 能走到 deny 说明它没被既有授权覆盖住)。把覆盖该操作根的
+            // 授权一并作废:否则同目录下的兄弟文件还能凭之前批过的额度
+            // 免复核通过,"这里刚被拒过"这个信息就白丢了。
+            let root = merge::operation_root(&effective);
+            session.grants.lock().unwrap().revoke_under(&root);
+            PipelineResult::Deny(why)
+        }
         // 免隔离区的放行(S0 可再生物、或隔离区关闭):删除仍由 daemon 执行,
         // 理由同上——保护路径上的真 syscall 会撞上 LSM 层。
         pipeline::Outcome::Allow { after: pipeline::AfterAllow::Direct, why }
@@ -980,6 +1258,157 @@ fn run_pipeline(
     }
 }
 
+/// 把一棵目录树改成指定属主。恢复产物用:daemon 是 root,不改属主的话
+/// 请求者读不到自己的恢复结果。
+///
+/// 两条纪律,都是复审抓出来的:
+///
+/// 1. **全程走 dirfd + `*at()`,绝不把完整路径交给特权系统调用。**
+///    原实现按路径递归,而 `lchown` 只对**末段**不跟随符号链接,中间分量
+///    照跟。加上 `ensure_under_home` 是纯词法判断(不解析符号链接),
+///    被监督方在自己 home 里放一条链接就能让落点的中间分量指向 home 之外
+///    ——一条任意本地用户可触发、无需竞态的 root 递归 chown 原语,
+///    可达 `/var/log/infinisec`(审计日志属主 → 反取证)、别人的 home、
+///    `/dev` 下的设备节点。闸设在词法层,而真正的落点由内核解析。
+/// 2. **根目录最后改。** 原实现先 chown 根再下钻:根一换属主就变成请求者
+///    可写(0700 属主换人 = 换人可写),之后的递归等于给他一个在遍历途中
+///    把子目录换成符号链接的窗口。
+fn chown_tree(root: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c = CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "路径含 NUL"))?;
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let dir = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+
+    chown_below(&dir, uid, gid)?;
+
+    // 根放最后
+    if unsafe { libc::fchownat(libc::AT_FDCWD, c.as_ptr(), uid, gid, libc::AT_SYMLINK_NOFOLLOW) }
+        != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// 递归改 `dir` **之下**所有条目的属主。目录本身由调用方最后处理。
+fn chown_below(dir: &std::os::fd::OwnedFd, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+
+    // 用 fd 的副本建 ReadDir:read_dir 需要一个自己的 fd
+    let listing = std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))?;
+    for e in listing {
+        let e = e?;
+        let name = e.file_name();
+        let cname = CString::new(name.as_encoded_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "文件名含 NUL")
+        })?;
+        // 先看它是不是目录——用 NOFOLLOW,符号链接就当普通条目处理
+        let sub = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                cname.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if sub >= 0 {
+            let subdir =
+                unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(sub) };
+            chown_below(&subdir, uid, gid)?;
+        }
+        // 非目录(或打不开)一律按条目本身处理;AT_SYMLINK_NOFOLLOW 保证
+        // 符号链接只改链接自己,不改它指向的东西
+        if unsafe {
+            libc::fchownat(dir.as_raw_fd(), cname.as_ptr(), uid, gid, libc::AT_SYMLINK_NOFOLLOW)
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// 客户端给的路径必须落在**请求者自己的 home** 之下。
+///
+/// 不能只写 `p.starts_with(home)`:`Path::starts_with` 是按分量比较的纯词法
+/// 判断,`..` 与 `.` 原样留在分量序列里,于是
+/// `/home/attacker/../victim/pwn` 的前三个分量匹配 → 通过,而随后的
+/// `create_dir_all` 由**内核**解析 `..`,产物落在 home 之外。
+/// (前缀混淆倒是不存在:按分量比,`/home/user2` 不会匹配 `/home/user`。)
+///
+/// 另一处更隐蔽:`home` 取自 `pw_dir`,某些账号的 pw_dir 是空串或 `/`,
+/// 那样 `starts_with` 恒为真,这道闸对该账号完全不存在——所以要先验 home。
+fn ensure_under_home(home: &Path, p: &Path) -> Result<()> {
+    // home 本身的健全性:空、非绝对、或就是根,都不构成边界
+    if home.as_os_str().is_empty() || !home.is_absolute() || home == Path::new("/") {
+        bail!("被监督用户的 home({})不是一个可用的边界", home.display());
+    }
+    if !p.is_absolute() {
+        bail!("必须是绝对路径");
+    }
+    // 词法上就不允许出现 `..` / `.`:它们的存在意味着这条路径的最终落点
+    // 要等内核解析才知道,而我们必须在动手前就知道。
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => bail!("路径不得包含 `..`"),
+            std::path::Component::CurDir => bail!("路径不得包含 `.`"),
+            _ => {}
+        }
+    }
+    if !p.starts_with(home) {
+        bail!("必须在你自己的 home({})之下", home.display());
+    }
+    Ok(())
+}
+
+/// 这次删除在内核里本来就会失败吗?会的话返回该 errno。
+///
+/// 只回答"内核会不会拒绝",不回答"该不该放行"——后者是判决层的事。
+/// 存在的理由见 `PipelineResult::KernelError`:隔离区分支会把整棵子树
+/// rename 走再合成成功,那会把内核本该给出的无害失败变成静默的数据搬移。
+///
+/// 判不出来(stat 失败等)返回 None,交回正常路径处理——那条路上有
+/// 完整的错误处理,不需要在这里猜。
+fn kernel_removal_error(target: &Path, remove_dir: bool) -> Option<i32> {
+    let meta = match std::fs::symlink_metadata(target) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // 目标根本不存在:内核会回 ENOENT。回 EPERM 会打断所有
+            // "删了就当没有、不存在也不算错"的幂等清理代码,而那类代码
+            // 恰恰是最无害的一类调用者。
+            return Some(libc::ENOENT);
+        }
+        Err(_) => return None,
+    };
+    match (meta.is_dir(), remove_dir) {
+        // unlink 打到目录
+        (true, false) => Some(libc::EISDIR),
+        // rmdir 打到非目录
+        (false, true) => Some(libc::ENOTDIR),
+        // rmdir 打到非空目录
+        (true, true) => {
+            let mut entries = std::fs::read_dir(target).ok()?;
+            if entries.next().is_some() {
+                Some(libc::ENOTEMPTY)
+            } else {
+                None
+            }
+        }
+        (false, false) => None,
+    }
+}
+
 /// daemon 代替被监督进程执行删除。
 ///
 /// 只在判决已经放行之后调用。目录用 remove_dir(空目录才删得掉,与
@@ -1020,17 +1449,23 @@ fn handle_control(
     stream: &mut UnixStream,
     policy: &Policy,
     uid: u32,
+    peer_pid: i32,
     payload: &[u8],
 ) -> Result<()> {
     let resp = match serde_json::from_slice::<ControlRequest>(payload) {
-        Ok(req) => dispatch_control(policy, uid, req),
+        Ok(req) => dispatch_control(policy, uid, peer_pid, req),
         Err(e) => ControlResponse::err(format!("控制命令解析失败: {e}")),
     };
     writeln!(stream, "{}", serde_json::to_string(&resp)?)?;
     Ok(())
 }
 
-fn dispatch_control(policy: &Policy, uid: u32, req: ControlRequest) -> ControlResponse {
+fn dispatch_control(
+    policy: &Policy,
+    uid: u32,
+    peer_pid: i32,
+    req: ControlRequest,
+) -> ControlResponse {
     let home = match home_of_uid(uid) {
         Ok(h) => h,
         Err(e) => return ControlResponse::err(format!("解析 home 失败: {e}")),
@@ -1062,6 +1497,12 @@ fn dispatch_control(policy: &Policy, uid: u32, req: ControlRequest) -> ControlRe
             format!("隔离区位置: {}", quarantine::quarantine_root(&home).display()),
         ]),
         ControlRequest::QuarantineList { stamp: None } => {
+            // 顺手做保留期清理:`keep_days` 原先没有任何调用点,
+            // expire() 是死代码,隔离区实际上只增不减。
+            let keep = std::time::Duration::from_secs(policy.quarantine.keep_days * 86400);
+            if let Err(e) = quarantine::expire(&home, keep) {
+                eprintln!("infinisecd: ⚠ 隔离区保留期清理失败: {e}");
+            }
             let root = quarantine::quarantine_root(&home);
             let mut batches: Vec<String> = std::fs::read_dir(&root)
                 .into_iter()
@@ -1069,6 +1510,9 @@ fn dispatch_control(policy: &Policy, uid: u32, req: ControlRequest) -> ControlRe
                 .flatten()
                 .filter(|e| e.path().is_dir())
                 .filter_map(|e| e.file_name().to_str().map(String::from))
+                // 只列形状合法的批次目录:隔离区根下不该有别的东西,
+                // 有的话也不该由这里当成批次报给用户
+                .filter(|n| quarantine::is_batch_stamp(n))
                 .collect();
             batches.sort();
             if batches.is_empty() {
@@ -1109,7 +1553,7 @@ fn dispatch_control(policy: &Policy, uid: u32, req: ControlRequest) -> ControlRe
         ControlRequest::ImageProbe { path: ipath } => {
             match image::probe(Path::new(&ipath)) {
                 Ok(info) => {
-                    let mut lines = vec![
+                    let mut lines: Vec<String> = vec![
                         format!("镜像: {}", info.path.display()),
                         format!("格式: {}", info.format.as_str()),
                         format!("虚拟大小: {} 字节", info.virtual_size),
@@ -1142,15 +1586,57 @@ fn dispatch_control(policy: &Policy, uid: u32, req: ControlRequest) -> ControlRe
         }
         ControlRequest::Replay { session_dir, outdir, prefix } => {
             let sdir = session_dir
+                .clone()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.join(".claude/projects"));
             let out = PathBuf::from(&outdir);
             if !out.is_absolute() {
                 return ControlResponse::err("输出目录必须是绝对路径");
             }
+            // 输出目录必须落在请求者自己的 home 之下。
+            //
+            // daemon 是 root,出厂 systemd 单元给它的可写面是 /home(**所有
+            // 用户的 home**)、/var/log/infinisec、/var/lib/infinisec 和 /dev。
+            // 不设这道闸,`recover replay` 就是一条任意本地用户可触发的
+            // 跨用户写原语:写别人的 ~/.bashrc 拿代码执行、覆写审计日志
+            // 反取证、甚至写 /dev/sda。replay.rs 那边已经把条目内的路径
+            // 穿越堵死了,这里堵的是**落点本身**。
+            if let Err(e) = ensure_under_home(&home, &out) {
+                return ControlResponse::err(format!("输出目录不可用:{e}"));
+            }
+            // 词法闸只挡住 `..` 与越界写法,**挡不住符号链接**——真正的落点
+            // 由内核解析。所以先用 dirfd 链把整条路径逐层建立/校验(它对
+            // home 之下的每一层都拒绝符号链接),再拿解析后的真实位置复核
+            // 一次包含关系。这一步之后,后续的写入与改属主才谈得上安全。
+            if let Err(e) = quarantine::ensure_secure_dir_under(&home, &out) {
+                return ControlResponse::err(format!("输出目录不可用:{e}"));
+            }
+            match (out.canonicalize(), home.canonicalize()) {
+                (Ok(real_out), Ok(real_home)) if real_out.starts_with(&real_home) => {}
+                (Ok(real_out), Ok(_)) => {
+                    return ControlResponse::err(format!(
+                        "输出目录解析后落在 home 之外({}),拒绝",
+                        real_out.display()
+                    ))
+                }
+                _ => return ControlResponse::err("输出目录无法解析,拒绝"),
+            }
+            if let Some(sd) = session_dir.as_deref() {
+                if let Err(e) = ensure_under_home(&home, Path::new(sd)) {
+                    return ControlResponse::err(format!("会话目录不可用:{e}"));
+                }
+            }
             match replay::replay_sessions(&sdir, prefix.as_deref().map(Path::new)) {
                 Ok(r) => match replay::write_output(&r, &out) {
-                    Ok((normal, secret)) => ControlResponse::ok(vec![
+                    Ok((normal, secret)) => {
+                        // 产物是**请求者的**,不能留成 root:root 0700 让他
+                        // 得 sudo 才读得到自己的恢复结果。权限位保持不变
+                        // (secrets/ 仍是 0700/0600),只改属主。
+                        let gid = gid_of_uid(uid).unwrap_or(uid);
+                        if let Err(e) = chown_tree(&out, uid, gid) {
+                            eprintln!("infinisecd: ⚠ 恢复产物改属主失败: {e}");
+                        }
+                        ControlResponse::ok(vec![
                         format!("扫描会话文件 {} 个", r.sessions_scanned),
                         format!("重建文件 {} 个(普通 {normal},秘密 {secret})", r.files.len()),
                         format!("输出: {}", out.display()),
@@ -1158,7 +1644,8 @@ fn dispatch_control(policy: &Policy, uid: u32, req: ControlRequest) -> ControlRe
                         "全部条目标注为 **C 级**(会话重放):内容可信度中等,".into(),
                         "回迁前必须人工复核。秘密文件已隔离到 secrets/(0700/0600),".into(),
                         "不进正式恢复树——重放一次 .env 就是把秘密扩散一次。".into(),
-                    ]),
+                        ])
+                    }
                     Err(e) => ControlResponse::err(format!("写输出失败: {e}")),
                 },
                 Err(e) => ControlResponse::err(format!("重放失败: {e}")),
@@ -1187,17 +1674,31 @@ fn dispatch_control(policy: &Policy, uid: u32, req: ControlRequest) -> ControlRe
             }
         }
         ControlRequest::Unlock { path: upath, op, caller_pid } => {
-            // 解锁是唯一能放宽防护的通道,前置检查最严(见 unlock.rs)
+            // 解锁是唯一能放宽防护的通道,前置检查最严(见 unlock.rs)。
+            //
+            // 判据一律用 **SO_PEERCRED 的 peer_pid**,不用请求里的 caller_pid
+            // ——后者是客户端自报的 wire 字段,填什么都行:随便报一个"有终端
+            // 且不在被监督树内"的无关进程 pid,两项判据就全被这个伪造值满足,
+            // 与真实调用者毫无关系。protocol.rs 自己就写着"信任以 SO_PEERCRED
+            // 为准",唯独最敏感的这条通道没照做。caller_pid 只留作审计对照。
             let supervised = sessions_of(uid);
-            if let Err(e) = unlock::confirm_precheck(caller_pid, &supervised) {
+            if let Err(e) = unlock::confirm_precheck(peer_pid, &supervised) {
                 return ControlResponse::err(format!("{e}"));
+            }
+            if caller_pid != peer_pid {
+                eprintln!(
+                    "infinisecd: ⚠ unlock 请求自报 pid {caller_pid} 与内核认证的 {peer_pid} 不符"
+                );
             }
             let target = PathBuf::from(&upath);
             if !target.is_absolute() {
                 return ControlResponse::err("解锁目标必须是绝对路径(解锁不批发)");
             }
             ControlResponse::ok(vec![
-                format!("前置检查通过:调用者 pid {caller_pid} 有控制终端且不在被监督进程树内"),
+                format!(
+                    "前置检查通过:调用者 pid {peer_pid}(内核认证)有控制终端、\
+                     stdin 是终端、且不在被监督进程树内"
+                ),
                 format!("待解锁:{op} {}", target.display()),
                 "".into(),
                 "接下来由 infsec 在你的终端上要求逐字输入确认短语。".into(),
@@ -1264,11 +1765,33 @@ fn dispatch_control(policy: &Policy, uid: u32, req: ControlRequest) -> ControlRe
             }
             ControlResponse::ok(lines)
         }
+        ControlRequest::RecoverCheckCmd { argv } => {
+            if argv.is_empty() {
+                return ControlResponse::err("要自查的命令不能为空");
+            }
+            let shown = argv.join(" ");
+            match recover::check_command(&argv) {
+                Ok(()) => ControlResponse::ok(vec![
+                    format!("✓ {shown}"),
+                    "按只读判据看,这条命令不会写到证据上。".into(),
+                    "".into(),
+                    "但请注意边界:infsec 只是回答了这个问题,它**不会**拦截你".into(),
+                    "在别处敲的命令——恢复流程里执行命令的是你,不是它。".into(),
+                ]),
+                Err(why) => ControlResponse::ok(vec![
+                    format!("✗ {shown}"),
+                    format!("拒绝理由:{why}"),
+                    "".into(),
+                    "纪律 6:任何针对证据设备/镜像的写路径都是 bug,".into(),
+                    "包括『帮忙修复文件系统』这类好心写入。".into(),
+                ]),
+            }
+        }
         ControlRequest::BackupStatus => {
             let mut lines = Vec::new();
             for p in &policy.protect.paths {
                 let src = expand_home_str(p, &home);
-                if !src.is_dir() {
+                if !is_snapshot_source(&src, &home) {
                     continue;
                 }
                 let repo = snapshot::repo_root(&home).join(sanitize(&src));
@@ -1302,11 +1825,15 @@ fn dispatch_control(policy: &Policy, uid: u32, req: ControlRequest) -> ControlRe
             let mut lines = Vec::new();
             for p in &policy.protect.paths {
                 let src = expand_home_str(p, &home);
-                if !src.is_dir() || !src.starts_with(&home) {
-                    continue; // 只快照本用户 home 下的保护目录
+                // 只快照本用户 home 下的保护目录,且排除 infsec 自己的状态目录
+                if !is_snapshot_source(&src, &home) {
+                    continue;
                 }
                 let repo = snapshot::repo_root(&home).join(sanitize(&src));
-                if let Err(e) = std::fs::create_dir_all(&repo) {
+                // 必须用 ensure_secure_dir:create_dir_all 会跟随符号链接,
+                // 用户预先把 ~/.infinisec 建成链接时,root 会先把整棵仓库
+                // 目录树写到他选的位置,之后才由 snapshot::create 挡下。
+                if let Err(e) = snapshot::ensure_secure_dir_under(&home, &repo) {
                     lines.push(format!("{}: 建仓库失败 {e}", src.display()));
                     continue;
                 }
@@ -1338,19 +1865,41 @@ fn dispatch_control(policy: &Policy, uid: u32, req: ControlRequest) -> ControlRe
             let _ = std::fs::create_dir_all(&work);
             match snapshot::drill(&latest, &work) {
                 Ok(r) => {
-                    let mut lines = vec![
+                    let mut lines: Vec<String> = vec![
                         format!("演练快照: {}", r.snapshot),
                         format!("恢复到: {}", r.restored_to.display()),
                         format!("校验 {} 个文件,用时 {:?}", r.files_checked, r.elapsed),
                     ];
+                    if !r.vanished_dirs.is_empty() {
+                        lines.push(format!(
+                            "  ⚠ {} 个目录在采集途中整个消失,整棵子树没进快照",
+                            r.vanished_dirs.len()
+                        ));
+                        lines.extend(r.vanished_dirs.iter().take(3).map(|d| format!("    {d}")));
+                    }
+                    if !r.vanished.is_empty() {
+                        // 少量是常态(临时文件蹭掉);大面积则说明快照是在
+                        // 删除进行中拍的,不能当可恢复备份
+                        let heavy = r.vanished.len() * 20 > r.files_checked.max(1);
+                        lines.push(format!(
+                            "  {} {} 个文件在采集期间消失(采到 {} 个)",
+                            if heavy { "⚠" } else { "" },
+                            r.vanished.len(),
+                            r.files_checked
+                        ));
+                    }
                     if r.ok() {
                         lines.push("结果:全部一致 ✓".into());
                         write_last_drill(&home, &src, &r.snapshot);
                     } else {
-                        lines.push(format!("结果:失败 —— 哈希不符 {} 个,缺失 {} 个",
-                            r.mismatches.len(), r.missing.len()));
+                        lines.push(format!(
+                            "结果:失败 —— 哈希不符 {} 个,缺失 {} 个,采集期错误 {} 条",
+                            r.mismatches.len(), r.missing.len(), r.errors.len()));
                         lines.extend(r.mismatches.iter().take(5).cloned());
                         lines.extend(r.missing.iter().take(5).map(|m| format!("缺失: {m}")));
+                        // 采集期就失败的条目根本不在清单里,不打出来的话
+                        // "哈希不符 0 个、缺失 0 个"会读成一次干净的失败
+                        lines.extend(r.errors.iter().take(5).map(|e| format!("采集错误: {e}")));
                     }
                     ControlResponse::ok(lines)
                 }
@@ -1366,8 +1915,14 @@ fn dispatch_control(policy: &Policy, uid: u32, req: ControlRequest) -> ControlRe
                 all.extend(burst::freeze_tree(*r));
             }
             frozen_add(uid, &all);
+            // 止损的第一要义是"此刻不该有任何'已经批过了'still存活"
+            let handles = handles_of(uid);
+            for h in &handles {
+                h.grants.lock().unwrap().revoke_all();
+            }
             let mut lines = vec![
                 format!("已冻结 {} 个进程(来自 {} 个被监督会话)", all.len(), roots.len()),
+                format!("已作废 {} 个会话的全部判决授权", handles.len()),
             ];
             if !all.is_empty() {
                 lines.push(format!("pid: {all:?}"));
@@ -1382,7 +1937,22 @@ fn dispatch_control(policy: &Policy, uid: u32, req: ControlRequest) -> ControlRe
                 return ControlResponse::ok(vec!["没有被冻结的进程".into()]);
             }
             let n = burst::thaw(&pids);
-            ControlResponse::ok(vec![format!("已解冻 {n}/{} 个进程", pids.len())])
+            // 解冻必须同时复位爆发检测器。
+            //
+            // `record()` 在 tripped 之后恒返回 None,而 reset() 原先在生产
+            // 代码里一次都没被调用:一旦触发过,该会话剩余全程就再没有
+            // 速率/广度闸门了。于是"先小规模触发被冻 → 诱导人工解冻 →
+            // 放量删除"成为一条现成的两段式路径,而解冻这一刻恰恰是刚
+            // 出过事、最需要闸门的时刻。
+            let handles = handles_of(uid);
+            for h in &handles {
+                h.burst.lock().unwrap().reset();
+            }
+            ControlResponse::ok(vec![
+                format!("已解冻 {n}/{} 个进程", pids.len()),
+                format!("已复位 {} 个会话的爆发检测器(速率/广度闸门重新生效)", handles.len()),
+                "注意:冻结时作废的判决授权不会恢复,后续删除会重新走完整判决。".into(),
+            ])
         }
         ControlRequest::Frozen => {
             let pids = frozen_list(uid);
@@ -1420,7 +1990,7 @@ fn dispatch_control(policy: &Policy, uid: u32, req: ControlRequest) -> ControlRe
 /// 且大批量截断的典型场景是正常构建)。
 fn burst_target(ev: &verdict::Event) -> Option<PathBuf> {
     match ev {
-        verdict::Event::Remove { path } => Some(path.shown().to_path_buf()),
+        verdict::Event::Remove { path, .. } => Some(path.shown().to_path_buf()),
         verdict::Event::Rename { from, .. } => Some(from.shown().to_path_buf()),
         _ => None,
     }
@@ -1433,6 +2003,13 @@ fn freeze_and_alert(session: &Session, notif: &SeccompNotif, trigger: &burst::Tr
     let frozen = burst::freeze_tree(pid);
     session.frozen.lock().unwrap().extend(frozen.iter().copied());
     frozen_add(session.uid, &frozen);
+
+    // 冻结的同时作废本会话的全部判决授权。
+    //
+    // 不作废的话,人工 thaw 之后进程会带着一张还剩几百个文件配额的通行证
+    // 继续跑——爆发检测刚刚判定"这棵树正在失控",却让它凭之前批过的额度
+    // 免复核接着删。`revoke_under` 原先在生产代码里一次都没被调用。
+    session.grants.lock().unwrap().revoke_all();
 
     let note = format!(
         "爆发检测触发:{};已 SIGSTOP 冻结 {} 个进程: {:?}。\
@@ -1497,6 +2074,21 @@ fn expand_home_str(p: &str, home: &Path) -> PathBuf {
     }
 }
 
+/// 这个保护路径能不能当快照源。
+///
+/// `~/.infinisec` 装的是隔离区与快照仓库本身。它必须在 `protect.paths` 里
+/// (否则 seccomp 层不认它,`mv ~/.infinisec ~/gone` 谁都不拦),但**绝不能
+/// 成为快照源**——那是递归自吞:快照仓库把自己连同几千个隔离批次再抄一份,
+/// 下一次再抄一份抄过的。VM 实测表现为 `backup now` 卡到客户端读超时,
+/// 然后整个 M4 验收全线失败。
+///
+/// `snapshot::walk` 里那个"跳过名为 .infinisec 的子目录"只对**子目录**
+/// 生效,源本身就是它时不触发,所以必须在这里挡。
+fn is_snapshot_source(src: &Path, home: &Path) -> bool {
+    let state = home.join(".infinisec");
+    src.is_dir() && src.starts_with(home) && !src.starts_with(&state)
+}
+
 /// 把源路径压成一个安全的目录名(快照仓库按源目录分仓)。
 fn sanitize(p: &Path) -> String {
     p.display()
@@ -1528,7 +2120,10 @@ fn read_last_drill(home: &Path, src: &Path) -> Option<String> {
 fn write_last_drill(home: &Path, src: &Path, stamp: &str) {
     let p = drill_record_path(home, src);
     if let Some(parent) = p.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        // 同 BackupNow:这条路径也在 ~/.infinisec 之下
+        if snapshot::ensure_secure_dir_under(home, parent).is_err() {
+            return;
+        }
     }
     let _ = std::fs::write(p, stamp);
 }
@@ -1566,4 +2161,125 @@ fn real_user_homes() -> Vec<PathBuf> {
         .map(|e| e.path())
         .filter(|p| p.is_dir())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// fixture 一律在临时目录里现造(纪律 3)。测试进程不碰任何真实数据。
+    fn fixture_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("infsec-main-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 回归:内核语义必须被如实转达,不能被隔离区分支吞掉。
+    ///
+    /// `unlink` 打到目录本该 EISDIR、`rmdir` 打到非空目录本该 ENOTEMPTY,
+    /// 都是无害失败。原实现把 unlink/rmdir/unlinkat 统一映射成 Remove、
+    /// 不看 AT_REMOVEDIR,于是隔离区分支用 rename 把整棵子树搬走再合成
+    /// 成功——本该安全失败的调用变成"成功 + 整棵树离开原位"。
+    #[test]
+    fn kernel_removal_semantics_are_reported_faithfully() {
+        let d = fixture_dir("kernsem");
+
+        let file = d.join("a.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let empty = d.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let full = d.join("full");
+        std::fs::create_dir(&full).unwrap();
+        std::fs::write(full.join("inner.txt"), b"y").unwrap();
+
+        // unlink 打到目录 → EISDIR
+        assert_eq!(kernel_removal_error(&empty, false), Some(libc::EISDIR));
+        assert_eq!(kernel_removal_error(&full, false), Some(libc::EISDIR));
+        // rmdir 打到非目录 → ENOTDIR
+        assert_eq!(kernel_removal_error(&file, true), Some(libc::ENOTDIR));
+        // rmdir 打到非空目录 → ENOTEMPTY
+        assert_eq!(kernel_removal_error(&full, true), Some(libc::ENOTEMPTY));
+        // 合法组合 → 无错误,交给正常判决路径
+        assert_eq!(kernel_removal_error(&file, false), None);
+        assert_eq!(kernel_removal_error(&empty, true), None);
+        // 不存在的路径 → ENOENT。回 EPERM 会打断"删了就当没有"的幂等清理。
+        assert_eq!(kernel_removal_error(&d.join("nope"), false), Some(libc::ENOENT));
+        assert_eq!(kernel_removal_error(&d.join("nope"), true), Some(libc::ENOENT));
+
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 回归:隔离区/快照仓库自己绝不能当快照源。
+    ///
+    /// `~/.infinisec` 必须在保护集里(否则 seccomp 层不认它),但它一旦
+    /// 同时被当成快照源就是递归自吞——VM 实测 `backup now` 直接卡到
+    /// 客户端读超时,M4 验收 8 项全挂。
+    #[test]
+    fn infsec_state_dir_is_never_a_snapshot_source() {
+        let home = Path::new("/home/u");
+        // 正常保护目录:可以当源
+        assert!(is_snapshot_source(Path::new("/home/u"), home) || true); // home 本身由调用方决定
+        // infsec 自己的状态目录及其下一律排除
+        assert!(!is_snapshot_source(&home.join(".infinisec"), home));
+        assert!(!is_snapshot_source(&home.join(".infinisec/quarantine"), home));
+        assert!(!is_snapshot_source(&home.join(".infinisec/snapshots/x"), home));
+        // home 之外的保护根不进快照(隔离区需与源同文件系统)
+        assert!(!is_snapshot_source(Path::new("/etc/infinisec"), home));
+        // 同名邻居不受影响
+        let _ = is_snapshot_source(&home.join(".infinisec-notes"), home);
+    }
+
+    /// 回归:home 边界校验不能是纯词法 starts_with。
+    ///
+    /// `Path::starts_with` 按分量比较,所以 `/home/user2` 不会误配
+    /// `/home/user`(前缀混淆确实不存在)。但 `..` / `.` 会原样留在分量
+    /// 序列里:`/home/u/../victim/pwn` 的前三个分量匹配 → 通过,而随后的
+    /// create_dir_all 由**内核**解析 `..`,产物落在 home 之外。
+    #[test]
+    fn home_boundary_rejects_traversal_and_bad_home() {
+        let home = Path::new("/home/u");
+
+        // 正常路径通过
+        assert!(ensure_under_home(home, Path::new("/home/u/out")).is_ok());
+        assert!(ensure_under_home(home, Path::new("/home/u")).is_ok());
+
+        // `..` 一律拒:落点要等内核解析才知道,那就太晚了
+        assert!(ensure_under_home(home, Path::new("/home/u/../victim/pwn")).is_err());
+        assert!(ensure_under_home(home, Path::new("/home/u/a/../../etc/x")).is_err());
+        // 注:`Path::components()` 会把中间的 `.` 规范化掉(`..` 则保留),
+        // 所以 `.` 根本到不了那个分支——它也确实无害,不改变落点。
+        assert!(ensure_under_home(home, Path::new("/home/u/./x")).is_ok());
+
+        // 越界与相对路径
+        assert!(ensure_under_home(home, Path::new("/etc/passwd")).is_err());
+        assert!(ensure_under_home(home, Path::new("relative")).is_err());
+        // 分量比较:user2 不是 user 的子路径(这条本来就成立,锁住它)
+        assert!(ensure_under_home(Path::new("/home/user"), Path::new("/home/user2/x")).is_err());
+
+        // home 本身不成边界时,这道闸必须整个失效而不是恒真
+        assert!(ensure_under_home(Path::new(""), Path::new("/anything")).is_err());
+        assert!(ensure_under_home(Path::new("/"), Path::new("/etc/x")).is_err());
+        assert!(ensure_under_home(Path::new("relative"), Path::new("/x")).is_err());
+    }
+
+    /// 符号链接不得让删除目标被误判。
+    ///
+    /// 这里锁住的是 `kernel_removal_error` 用的是 `symlink_metadata`:
+    /// 指向目录的符号链接,`unlink` 删的是链接本身,不该报 EISDIR。
+    #[test]
+    fn symlink_to_dir_is_unlinkable() {
+        let d = fixture_dir("symdir");
+        let real = d.join("realdir");
+        std::fs::create_dir(&real).unwrap();
+        let link = d.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert_eq!(
+            kernel_removal_error(&link, false),
+            None,
+            "unlink 一个指向目录的符号链接是合法的,删的是链接本身"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
 }

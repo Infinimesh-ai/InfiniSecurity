@@ -49,7 +49,14 @@ const S3_PREFIXES: &[&str] = &["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", ".e
 const S3_DIR_NAMES: &[&str] = &["snapshots", "reports", "backups"];
 
 /// S4 基础设施:固定清单(目录名)。
-const S4_DIR_NAMES: &[&str] = &[".git", ".claude", ".codex", ".ssh", ".gnupg"];
+///
+/// `.infinisec` 在列:它装着隔离区与快照——**放行的删除能不能找回全靠它**。
+/// 它原先只出现在策略的 `lsm_absolute` 里(内核层 anti-tamper),却既不在
+/// `protect.paths` 也不在这里,于是 `mv ~/.infinisec ~/gone` 两层都不拦,
+/// 而 `infsec lsm status` 与 install-vm.sh 都在宣称"任何进程都删不掉
+/// 隔离区/快照"。补进 S4 让 seccomp 层也认它。
+const S4_DIR_NAMES: &[&str] =
+    &[".git", ".claude", ".codex", ".ssh", ".gnupg", ".infinisec"];
 
 /// infsec 自身的路径(S4 自保护,PLAN 2.4.2a)。
 const S4_INFSEC_PREFIXES: &[&str] = &[
@@ -69,8 +76,16 @@ pub enum GitState {
     TrackedDirty,
     /// 未跟踪(新文件)。
     Untracked,
-    /// 被 .gitignore 忽略。
+    /// 被 .gitignore 忽略,**且忽略规则的来源是可信的**(已提交且干净的
+    /// .gitignore,或 .git/info/exclude)。只有这种才当可再生物。
     Ignored,
+    /// 被 .gitignore 忽略,但忽略规则来自**本会话可改写**的文件。
+    ///
+    /// 存在的理由:写 .gitignore 不在拦截集内,被监督的 Agent 可以随手
+    /// 追加一行 `*`,把整个仓库的未跟踪文件变成 "Ignored" → S0 →
+    /// 免复核 + 免隔离区 + daemon 直删。那等于让**被审查方自己决定
+    /// 自己的风险等级**。判不出来源可信就按未跟踪处理(S2)。
+    IgnoredUntrusted,
     /// 不在任何 git 仓库里,或查询失败。
     Unknown,
 }
@@ -94,6 +109,8 @@ pub fn classify(path: &Path, git: GitState) -> PathClass {
         GitState::TrackedClean => PathClass::S1,
         GitState::TrackedDirty | GitState::Untracked => PathClass::S2,
         GitState::Ignored => PathClass::S0,
+        // 来源不可信的 ignore 不降级:与未跟踪同级处理
+        GitState::IgnoredUntrusted => PathClass::S2,
         // 不在 git 里 = 没有仓库这层恢复网 = 按未提交内容的严格度处理
         GitState::Unknown => PathClass::S2,
     }
@@ -197,6 +214,44 @@ mod tests {
         assert_eq!(c("/home/u/proj/src/new.rs", GitState::Untracked), PathClass::S2);
         // 不在 git 里:没有仓库这层网,按 S2 严格度处理
         assert_eq!(c("/home/u/notes/todo.md", GitState::Unknown), PathClass::S2);
+    }
+
+    /// 回归:被监督方能改写的 .gitignore 不得用来自降等级。
+    ///
+    /// 写 .gitignore 不在拦截集内,Agent 追加一行 `*` 就能让整个仓库的
+    /// 未跟踪文件变 Ignored → S0(免复核 + 免隔离区 + root 直删)。
+    /// 而未跟踪文件正是事故里最难恢复的那一类。
+    #[test]
+    fn untrusted_ignore_does_not_downgrade() {
+        assert_eq!(
+            c("/home/u/proj/src/feature.rs", GitState::IgnoredUntrusted),
+            PathClass::S2,
+            "来源不可信的 ignore 必须按未跟踪处理"
+        );
+        // 可信来源仍然按可再生物走(不要修坏正常路径)
+        assert_eq!(c("/home/u/proj/tmp.log", GitState::Ignored), PathClass::S0);
+        // 内置 S0 名单不依赖 git 状态,仍然是 S0
+        assert_eq!(
+            c("/home/u/proj/node_modules/x/i.js", GitState::IgnoredUntrusted),
+            PathClass::S0
+        );
+        // S3/S4 仍然压过一切
+        assert_eq!(c("/home/u/proj/.env", GitState::IgnoredUntrusted), PathClass::S3);
+        assert_eq!(c("/home/u/proj/.git/HEAD", GitState::IgnoredUntrusted), PathClass::S4);
+    }
+
+    /// 隔离区与快照的根必须是 S4:放行的删除能否找回全靠它。
+    #[test]
+    fn infinisec_state_dir_is_s4() {
+        for p in [
+            "/home/u/.infinisec",
+            "/home/u/.infinisec/quarantine/20260731T000000.000Z-1/x",
+            "/home/u/.infinisec/snapshots/repo/manifest.json",
+        ] {
+            assert_eq!(c(p, GitState::Unknown), PathClass::S4, "{p}");
+        }
+        // 前缀不能误伤同名邻居
+        assert_ne!(c("/home/u/.infinisec-notes", GitState::Unknown), PathClass::S4);
     }
 
     /// 事故里最难恢复的就是未提交的 2242 行——这条不能退化。

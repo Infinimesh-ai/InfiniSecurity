@@ -201,12 +201,24 @@ pub fn compose(input: &RiskInput) -> RiskLevel {
     // 情景修正(只会更严)
     tier = input.profile.adjust(tier);
 
-    // 预授权:声明范围内的操作免二审。但它只能放宽到 T1,
-    // 碰不到 S3/S4 的底线,更碰不到 T0——"我说要删"不是"删什么都行"。
+    // 预授权:声明范围内的操作免二审。但它碰不到 S3/S4 的底线,
+    // 碰不到 T0,**也碰不到情景底线**——"我说要删"不是"删什么都行",
+    // 更不是"这台机器是生产服务器可以不算数"。
+    //
+    // 情景底线这一条是补上来的:原实现把 tier 无条件压回 T1,而情景修正
+    // 在它之前执行,于是 Server 的"全体 ≥ T2"与 Autonomous 的"收紧一级"
+    // 被预授权整个抵消——backup=T1 / S1 / Server / preauth 会一路回到 T1,
+    // 低于 Server 自己声称的底线。预授权能放宽到的下限,是**该情景本身
+    // 允许的最低等级**,不是绝对的 T1。
+    //
+    // 对 CI 的含义:CI 的修正是 stricter(T2),所以清单内的删除仍是 T2、
+    // 仍需二审后端。这与 adjust() 里"CI 走预授权清单,清单外一律 deny
+    // ——等级本身按最严算"的原意一致:预授权决定的是**允不允许**,
+    // 不是**要不要复核**。
     if input.preauthorized && tier.severity() < Tier::T3.severity() {
-        let floor = input.path_class.floor().unwrap_or(Tier::T1);
-        if floor.severity() <= Tier::T1.severity() {
-            tier = Tier::T1;
+        let class_floor = input.path_class.floor().unwrap_or(Tier::T1);
+        if class_floor.severity() <= Tier::T1.severity() {
+            tier = Tier::T1.stricter(input.profile.adjust(Tier::T1));
         }
     }
 
@@ -323,6 +335,62 @@ mod tests {
         let mut i = input(Tier::T3, PathClass::S1, Profile::Interactive);
         i.preauthorized = true;
         assert_eq!(compose(&i).tier, Tier::T3);
+    }
+
+    /// 回归:预授权不得抵消情景底线。
+    ///
+    /// 原实现把 tier 无条件压回 T1,而情景修正在它之前执行,于是
+    /// `--may-delete` 能把 Server 的"全体 ≥ T2"和 Autonomous 的
+    /// "收紧一级"整个抹掉。这条覆盖的正是那个组合——既有的
+    /// `profile_only_tightens` 只测无预授权,`preauthorization_cannot_cross_floors`
+    /// 只测 Interactive,两者都漏过了它。
+    #[test]
+    fn preauthorization_cannot_undo_profile_floor() {
+        for (p, want) in [
+            (Profile::Interactive, Tier::T1),
+            (Profile::Autonomous, Tier::T2),
+            (Profile::Ci, Tier::T2),
+            (Profile::Server, Tier::T2),
+        ] {
+            let mut i = input(Tier::T1, PathClass::S1, p);
+            i.preauthorized = true;
+            assert_eq!(
+                compose(&i).tier,
+                want,
+                "{p:?} 的情景底线被预授权抵消了"
+            );
+        }
+    }
+
+    /// 更强的不变式:预授权在任何维度组合下都不得让等级低于
+    /// "同输入但无预授权时的情景底线"。
+    #[test]
+    fn preauthorization_never_below_profile_floor() {
+        for p in [
+            Profile::Interactive,
+            Profile::Autonomous,
+            Profile::Ci,
+            Profile::Server,
+        ] {
+            let floor = p.adjust(Tier::T1);
+            for c in [
+                PathClass::S0,
+                PathClass::S1,
+                PathClass::S2,
+                PathClass::S3,
+                PathClass::S4,
+            ] {
+                for t in [Tier::T1, Tier::T2, Tier::T3, Tier::T0] {
+                    let mut i = input(t, c, p);
+                    i.preauthorized = true;
+                    let out = compose(&i).tier;
+                    assert!(
+                        out.severity() >= floor.severity(),
+                        "预授权把 {p:?}×{c:?}×{t:?} 降到了 {out:?},低于情景底线 {floor:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

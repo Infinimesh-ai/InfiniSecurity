@@ -52,8 +52,11 @@ fn usage() -> ! {
     eprintln!("  infsec recover capabilities  本机能覆盖恢复矩阵的哪几格");
     eprintln!("  infsec recover image <镜像>  探测格式/链完整性/加密卷");
     eprintln!("  infsec recover replay <输出目录> [会话目录] [路径前缀]");
+    eprintln!("      输出目录与会话目录都必须在你自己的 home 之下,且不含 `..`;");
+    eprintln!("      输出目录必须是空的——本工具绝不覆盖已恢复的内容。");
     eprintln!("                               会话重放恢复(C 级,秘密隔离)");
     eprintln!("  infsec recover gate <设备> [挂载点] [--confirm-host-readonly]");
+    eprintln!("  infsec recover check-cmd <命令...>  执行前自查:这条命令会不会写证据");
     eprintln!("                               三层只读门禁校验(不齐不放行)");
     eprintln!("  infsec quarantine list [批次]");
     eprintln!("  infsec quarantine restore <批次> <绝对路径>");
@@ -244,13 +247,34 @@ fn real_main() -> Result<()> {
                     None => usage(),
                 },
                 Some("gate") => match argv.get(3) {
-                    Some(dev) => control(ControlRequest::RecoverGate {
-                        device: dev.clone(),
-                        mountpoint: argv.get(4).filter(|s| s.starts_with('/')).cloned(),
-                        host_confirmed: argv.iter().any(|a| a == "--confirm-host-readonly"),
-                    }),
+                    Some(dev) => {
+                        // 挂载点参数原先用 filter(starts_with('/')) **静默丢弃**
+                        // 不以 / 开头的输入,于是手误敲成相对路径时不会报错,
+                        // 而是走进"未挂载 → 通过"的分支。安全门禁里静默丢参数
+                        // 是不能接受的:宁可报错,也不能让人以为查过了。
+                        let mp = argv.get(4).filter(|s| !s.starts_with("--"));
+                        if let Some(m) = mp {
+                            if !m.starts_with('/') {
+                                eprintln!("infsec: 挂载点必须是绝对路径,收到 {m:?}");
+                                std::process::exit(2);
+                            }
+                        }
+                        control(ControlRequest::RecoverGate {
+                            device: dev.clone(),
+                            mountpoint: mp.cloned(),
+                            host_confirmed: argv.iter().any(|a| a == "--confirm-host-readonly"),
+                        })
+                    }
                     None => usage(),
                 },
+                Some("check-cmd") => {
+                    let rest: Vec<String> = argv.iter().skip(3).cloned().collect();
+                    if rest.is_empty() {
+                        usage()
+                    } else {
+                        control(ControlRequest::RecoverCheckCmd { argv: rest })
+                    }
+                }
                 _ => usage(),
             }
         }

@@ -2,11 +2,19 @@
 # M1 验收 —— 在验收虚拟机里以【被监督普通用户】身份运行。
 #
 # 纪律自检(动手前的最坏情况回答,AGENTS.md 纪律 4):
-#   本脚本会执行的命令只有:touch /tmp/infsec-probe-marker(无害探针)、
-#   对现造 fixture 的 unlink/rmdir/truncate/mv、sleep、bash、sudo --version、
-#   systemctl 查询。全脚本不含 rm / dd / mkfs / find -delete。
-#   所有安全层全部放行时的最坏结果 = /tmp 里多一个标记文件、
-#   /tmp 下现造的 fixture 目录被删。触碰不到任何真实数据。
+#   会发起的破坏性动作只有三类,全部有界:
+#   1) 无害探针 touch /tmp/infsec-probe-marker(纪律 1 的标准样本);
+#   2) 对 /tmp 下现造 fixture 的 unlink/rmdir/truncate/mv —— 最坏 = fixture 没了;
+#   3) 对**真实**策略/审计的删除与截断尝试(这是 anti-tamper 验收项本身):
+#      这几行只在脚本先确认 infsec 之外还有 DAC 兜底(文件与其父目录对本用户
+#      都不可写)之后才发起,兜底不在就报 SKIP 不发起;
+#      所以"所有 infsec 层都放行"时真实策略与审计仍然删不掉、清不空,
+#      而"删不掉"是不是 infsec 拒的,由审计里的 deny 记录单独归因。
+#   root 侧会改真实配置(observe/enforce 切换、临时 PrivateTmp drop-in、
+#   停/起 infinisecd、给策略加一行 fixture 路径),这些是验收本身需要的,
+#   全部由 trap cleanup 还原;它们改配置与服务状态,不删任何数据。
+#   全脚本不含 rm / dd / mkfs / shred / git clean / find -delete;
+#   fixture 清理只用 unlink/rmdir。
 #
 # root 配合:需要改策略、重启服务、读审计。脚本用 sudo -S 走密码
 #   (仅限验收 VM)。设 INFSEC_SUDO_PASS 环境变量;未设则改为交互提示,
@@ -23,12 +31,26 @@ PROBE=/tmp/infsec-probe-marker
 AUDIT=/var/log/infinisec/audit.jsonl
 POLICY=/etc/infinisec/policy.toml
 FIX=$(mktemp -d /tmp/infsec-accept-XXXXXX)
-PASS=0; FAIL=0; FAILED_ITEMS=()
+# mktemp 失败会让 $FIX 变成空串,于是 "$FIX/protected" 就成了 "/protected"——
+# 后面每一个 unlink/truncate/mv 都会指向文件系统根下的路径。宁可现在就停。
+[[ -n "$FIX" && -d "$FIX" && "$FIX" == /tmp/infsec-accept-* ]] \
+    || { echo "fixture 根目录没建出来($FIX),中止" >&2; exit 1; }
+PASS=0; FAIL=0; SKIP=0; FAILED_ITEMS=(); SKIPPED_ITEMS=()
 
 note()  { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 ok()    { printf '  \033[1;32mPASS\033[0m %s\n' "$*"; PASS=$((PASS+1)); }
 bad()   { printf '  \033[1;31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); FAILED_ITEMS+=("$*"); }
-chk()   { if [[ $1 == PASS ]]; then ok "$2"; else bad "$2"; fi; }
+# SKIP = 前置条件不成立,本轮没测。单独计数,绝不并进 PASS——
+# 把"没测"记成"通过"是这类脚本最坏的失效方式。
+skip()  { printf '  \033[1;33mSKIP\033[0m %s\n' "$*"; SKIP=$((SKIP+1)); SKIPPED_ITEMS+=("$*"); }
+chk()   { case "$1" in PASS) ok "$2" ;; SKIP) skip "$2" ;; *) bad "$2" ;; esac; }
+
+# 真实策略/审计的删除尝试只在这个前提成立时才发起:
+# 文件本身与其父目录对本用户都不可写 → infsec 全部放行也删不掉、清不空。
+dac_protects() {
+    local f=$1
+    [[ -e $f && ! -w $f && ! -w $(dirname "$f") ]]
+}
 pause() { [[ $MANUAL -eq 1 ]] && { printf '\n\033[1;33m[人工复核]\033[0m %s\n按回车继续... ' "$*"; read -r; }; return 0; }
 
 if [[ $EUID -eq 0 ]]; then
@@ -48,10 +70,21 @@ restart_daemon() { asroot systemctl restart infinisecd; sleep 1; }
 
 cleanup() {
     [[ -e $PROBE ]] && unlink "$PROBE" 2>/dev/null
-    asroot bash -c "sed -i '/infsec-accept-/d' $POLICY; sed -i 's/^mode = \"observe\"/mode = \"enforce\"/' $POLICY" 2>/dev/null
+    # 第三条 sed:万一 anti-tamper 那项真的失败了(普通用户写进了策略),
+    # 把写进去的那一行原样撤掉,别让验收自己留下改动。
+    asroot bash -c "sed -i '/infsec-accept-/d' $POLICY; sed -i 's/^mode = \"observe\"/mode = \"enforce\"/' $POLICY; sed -i '/^# tamper$/d' $POLICY" 2>/dev/null
+    # ③+ 用来制造挂载视图分叉的 drop-in:脚本中途失败时也必须撤掉。
+    # 留在机器上 = daemon 一直带着 PrivateTmp 跑,路径判决会静默失效
+    # ——那正是 M1 在 VM 上抓到的那个 bug,不能由验收脚本亲手种回去。
+    asroot bash -c '[ -e /etc/systemd/system/infinisecd.service.d/badview.conf ] && {
+        unlink /etc/systemd/system/infinisecd.service.d/badview.conf
+        rmdir /etc/systemd/system/infinisecd.service.d 2>/dev/null
+        systemctl daemon-reload; }' 2>/dev/null
     asroot systemctl restart infinisecd 2>/dev/null
     # fixture 只用 unlink/rmdir 清理(纪律 1:验收脚本不含 rm)
-    find "$FIX" -type f -exec unlink {} \; 2>/dev/null
+    # `! -type d` 而不是 `-type f`:后者匹配不到符号链接,于是链接留下来、
+    # 目录非空、rmdir 失败,fixture 就永远残留(VM 实测 M4 每跑一次留一个)。
+    find "$FIX" ! -type d -exec unlink {} \; 2>/dev/null
     find "$FIX" -depth -type d -exec rmdir {} \; 2>/dev/null
 }
 trap cleanup EXIT
@@ -124,15 +157,54 @@ sleep 6
 [[ -e $PROBE ]] && chk FAIL "启动器退出后孤儿子进程逃出监督" || chk PASS "孤儿子进程仍被过滤(filter 不可摘)"
 
 echo "# tamper" >> "$POLICY" 2>/dev/null && chk FAIL "普通用户写进了策略文件" || chk PASS "直接写策略被 DAC 拒"
-infsec run -- unlink "$POLICY" >/dev/null 2>&1
-[[ -e $POLICY ]] && chk PASS "经监督通道删策略被拒" || chk FAIL "策略被删"
-infsec run -- unlink "$AUDIT" >/dev/null 2>&1
-[[ -e $AUDIT ]] && chk PASS "删审计日志被拒" || chk FAIL "审计被删"
-infsec run -- /bin/sh -c "> $AUDIT" >/dev/null 2>&1
-[[ -s $AUDIT ]] && chk PASS "截断审计日志被拒" || chk FAIL "审计被清空"
+
+# 下面两组尝试打在**真实**策略与审计上,所以先确认 DAC 兜底在位(纪律 4):
+# 兜底在 → 即使 infsec 全放行也删不掉;兜底不在 → 报 SKIP,不硬试。
+# 又因为 DAC 会替 infsec 挡下来,"文件还在"证明不了是 infsec 拒的,
+# 所以每组再看一眼审计里有没有对应的 deny —— 那才是对被测层的归因。
+# 只看"这次尝试之后新追加的审计行",避免翻到上一轮验收留下的旧 deny。
+audit_lines() { asroot wc -l "$AUDIT" 2>/dev/null | awk '{print $1}'; }
+new_deny_for() {  # $1 = 起始行号  $2 = 目标路径
+    asroot tail -n "+$(( ${1:-0} + 1 ))" "$AUDIT" 2>/dev/null \
+        | grep -F "$2" | grep -q '"verdict":"deny"'
+}
+
+if dac_protects "$POLICY"; then
+    AL=$(audit_lines)
+    infsec run -- unlink "$POLICY" >/dev/null 2>&1
+    [[ -e $POLICY ]] && chk PASS "经监督通道删策略后策略仍在" || chk FAIL "策略被删"
+    new_deny_for "$AL" "$POLICY" \
+        && chk PASS "该次删除由 infsec 层判 deny(审计可证,不是只靠 DAC 兜底)" \
+        || chk FAIL "审计里没有这次删策略的 deny 记录:拦下它的可能只是 DAC"
+else
+    chk SKIP "策略文件缺 DAC 兜底(本用户可写),按纪律 4 不对真实策略发起删除尝试"
+    chk SKIP "同上:删策略的 infsec 归因未测"
+fi
+
+if dac_protects "$AUDIT"; then
+    AL=$(audit_lines)
+    infsec run -- unlink "$AUDIT" >/dev/null 2>&1
+    [[ -e $AUDIT ]] && chk PASS "删审计日志后审计仍在" || chk FAIL "审计被删"
+    infsec run -- /bin/sh -c "> $AUDIT" >/dev/null 2>&1
+    [[ -s $AUDIT ]] && chk PASS "截断审计日志后审计非空" || chk FAIL "审计被清空"
+    new_deny_for "$AL" "$AUDIT" \
+        && chk PASS "删/截断审计由 infsec 层判 deny(审计可证)" \
+        || chk FAIL "审计里没有这次针对审计日志的 deny 记录:拦下它的可能只是 DAC"
+else
+    chk SKIP "审计日志缺 DAC 兜底(本用户可写),不对真实审计发起删除/截断尝试"
+    chk SKIP "同上:截断审计日志一项未测"
+    chk SKIP "同上:删/截断审计的 infsec 归因未测"
+fi
 
 DPID=$(pgrep -x infinisecd | head -1)
-kill -9 "$DPID" 2>/dev/null && chk FAIL "普通用户杀掉了 daemon" || chk PASS "kill daemon 无权限"
+if [[ -z "${DPID:-}" ]]; then
+    # 找不到 daemon 时 kill 必然"失败",那不是权限不足,是根本没这个进程。
+    chk FAIL "找不到 infinisecd 进程,anti-tamper 无从谈起"
+elif kill -9 "$DPID" 2>/dev/null; then
+    chk FAIL "普通用户杀掉了 daemon"
+else
+    chk PASS "kill daemon 无权限"
+fi
 infsec run -- /usr/bin/systemctl stop infinisecd >/dev/null 2>&1
 systemctl is-active infinisecd | grep -q active && chk PASS "systemctl stop 被签名层拦下" || chk FAIL "服务被停掉"
 
@@ -173,7 +245,16 @@ restart_daemon
 infsec run -- touch "$PROBE" >/dev/null 2>&1
 [[ -e $PROBE ]] && chk PASS "observe 下探针放行" || chk FAIL "observe 下仍拦截"
 [[ -e $PROBE ]] && unlink "$PROBE"
-asroot grep -q observe-allow "$AUDIT" && chk PASS "observe-allow 记录入审计" || chk FAIL "observe 未留审计"
+# 探针命中的是签名层(硬拒、不进流水线),所以 observe 下的预测结论必须是
+# would-deny。断言到**具体标签**而不是"含 observe 字样":observe 的价值全在
+# 于它能不能如实预告 enforce 会怎么处置,记成什么都算过等于没测。
+if asroot grep -q '"verdict":"observe-would-deny"' "$AUDIT"; then
+    chk PASS "observe 如实预告 enforce 会拒(observe-would-deny)"
+elif asroot grep -q 'observe-allow' "$AUDIT"; then
+    chk FAIL "observe 只记了粗判决,没有给出分级预测"
+else
+    chk FAIL "observe 未留审计"
+fi
 asroot sed -i 's/^mode = "observe"/mode = "enforce"/' "$POLICY"
 restart_daemon
 infsec run -- touch "$PROBE" >/dev/null 2>&1
@@ -187,7 +268,10 @@ pause "查审计:signature:priv-escalation"
 
 # ---------------------------------------------------------------
 note "结果"
-printf '\033[1;32m%d PASS\033[0m / \033[1;31m%d FAIL\033[0m\n' "$PASS" "$FAIL"
+printf '\033[1;32m%d PASS\033[0m / \033[1;31m%d FAIL\033[0m / \033[1;33m%d SKIP\033[0m(SKIP 不计入 PASS)\n' "$PASS" "$FAIL" "$SKIP"
+if [[ $SKIP -gt 0 ]]; then
+    printf '跳过项(本轮未覆盖,需人工判断能否接受):\n'; printf '  - %s\n' "${SKIPPED_ITEMS[@]}"
+fi
 if [[ $FAIL -gt 0 ]]; then
     printf '失败项:\n'; printf '  - %s\n' "${FAILED_ITEMS[@]}"
 fi

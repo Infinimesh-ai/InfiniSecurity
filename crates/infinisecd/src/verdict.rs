@@ -19,7 +19,12 @@ pub enum Event {
     /// 的规则使用它)。
     Exec { argv: Vec<String>, resolved_args: Vec<PathBuf> },
     /// unlink/unlinkat/rmdir:删除目标。
-    Remove { path: PathId },
+    ///
+    /// `remove_dir` 区分 rmdir 语义(rmdir、或带 AT_REMOVEDIR 的 unlinkat)
+    /// 与 unlink 语义。判决核不关心它,但放行侧必须照内核语义办事:
+    /// `unlink` 打到目录本该 EISDIR、`rmdir` 打到非空目录本该 ENOTEMPTY,
+    /// 两个都是无害失败,不能被隔离区分支变成"整棵子树搬走 + 合成成功"。
+    Remove { path: PathId, remove_dir: bool },
     /// rename 族:源与目的。
     Rename { from: PathId, to: PathId, to_exists: bool },
     /// truncate / open(O_TRUNC) / creat:截断目标与其存在性。
@@ -43,7 +48,7 @@ impl VerdictCore<'_> {
     pub fn decide(&self, ev: &Event) -> Verdict {
         match ev {
             Event::Exec { argv, resolved_args } => self.decide_exec(argv, resolved_args),
-            Event::Remove { path } => match self.hit(path) {
+            Event::Remove { path, .. } => match self.hit(path) {
                 Some(rule) => Verdict::Deny { rule },
                 None => Verdict::Allow,
             },
@@ -180,14 +185,17 @@ mod tests {
         let core = VerdictCore { protected: &pset, signatures: &sigs };
         let deny = core.decide(&Event::Remove {
             path: PathId::single(PathBuf::from("/home/u/Documents/proj/main.go")),
+            remove_dir: false,
         });
         assert!(deny.is_deny());
         let deny = core.decide(&Event::Remove {
             path: PathId::single(PathBuf::from("/tmp/repo/.git/HEAD")),
+            remove_dir: false,
         });
         assert!(deny.is_deny(), ".git 内容受保护");
         let allow = core.decide(&Event::Remove {
             path: PathId::single(PathBuf::from("/tmp/scratch/file.txt")),
+            remove_dir: false,
         });
         assert_eq!(allow, Verdict::Allow);
     }

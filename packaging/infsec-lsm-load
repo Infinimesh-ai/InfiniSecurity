@@ -22,5 +22,10 @@ bpftool prog loadall "$OBJ" "$PIN/prog" pinmaps "$PIN" autoattach
 
 echo "已加载并 attach:"
 ls "$PIN"
+echo
+echo "注意:新加载的 map 是清零的(observe + 无保护前缀 + 无豁免 pid)。"
+echo "     策略由 infinisecd 在**启动时**写入,所以必须让它重跑一次:"
+echo "       systemctl restart infinisecd"
+echo "     本单元的 ExecStartPost 已代为触发;手工调用本脚本时请自行执行。"
 echo "--- LSM link ---"
 bpftool link list 2>/dev/null | grep -A2 lsm | head -10 || true
