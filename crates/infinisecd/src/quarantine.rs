@@ -99,7 +99,7 @@ pub enum Preserved {
 /// 读得到自己的数据(可恢复)。已存在的目录不动权限——那可能是 `$HOME`
 /// 这类不归我们管的目录。
 pub fn ensure_secure_dir(path: &Path) -> std::io::Result<()> {
-    ensure_secure_dir_under(Path::new("/"), path)
+    ensure_secure_dir_under(Path::new("/"), path).map(|_| ())
 }
 
 /// 从 `trusted_base` 开始逐级建立并校验 `path`,`trusted_base` **之下**的
@@ -113,7 +113,14 @@ pub fn ensure_secure_dir(path: &Path) -> std::io::Result<()> {
 /// 一开始一律从 `/` 起校验,结果是:这类机器上每一次隔离/快照都失败,
 /// 而"保全失败就不放行"会把保护路径下的**所有删除**变成 Deny。安全装置
 /// 误报到这个程度就等于被卸载——方向从严不代表可以无视可用性。
-pub fn ensure_secure_dir_under(trusted_base: &Path, path: &Path) -> std::io::Result<()> {
+/// 返回**最终那一层目录的 fd**。
+///
+/// 返回 fd 而不是 `()` 是必需的:校验完就丢掉 fd,保证只在那一瞬间成立
+/// ——调用方随后拿字符串路径去写、去 chown,内核会重新解析中间分量,
+/// 而 `$HOME` 正是被监督用户能写的地方,他可以在校验与使用之间把某一层
+/// 换成符号链接。把已校验的 inode 以 fd 形式交出去,后续操作走 `*at()`,
+/// 才谈得上"检查过的就是用到的那一个"。
+pub fn ensure_secure_dir_under(trusted_base: &Path, path: &Path) -> std::io::Result<OwnedFd> {
     use std::io::{Error, ErrorKind};
 
     if !path.is_absolute() {
@@ -153,7 +160,7 @@ pub fn ensure_secure_dir_under(trusted_base: &Path, path: &Path) -> std::io::Res
     walk_and_create(&mut cur, &mut walked, &rest, path)
 }
 
-fn ensure_secure_dir_from_root(path: &Path) -> std::io::Result<()> {
+fn ensure_secure_dir_from_root(path: &Path) -> std::io::Result<OwnedFd> {
     use std::io::Error;
     let root = CString::new("/").expect("\"/\" 不含 NUL");
     let mut cur = open_nofollow(None, &root)
@@ -167,7 +174,7 @@ fn walk_and_create(
     walked: &mut PathBuf,
     rel: &Path,
     path: &Path,
-) -> std::io::Result<()> {
+) -> std::io::Result<OwnedFd> {
     use std::io::{Error, ErrorKind};
 
     for comp in rel.components() {
@@ -236,7 +243,8 @@ fn walk_and_create(
         }
         *cur = next;
     }
-    Ok(())
+    // 把最终那一层的 fd 交给调用方(见 ensure_secure_dir_under 的文档)
+    cur.try_clone()
 }
 
 /// `openat(..., O_PATH | O_NOFOLLOW)`:符号链接不跟随,而是拿到指向

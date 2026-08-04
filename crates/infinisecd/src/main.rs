@@ -1261,60 +1261,86 @@ fn run_pipeline(
 /// 把一棵目录树改成指定属主。恢复产物用:daemon 是 root,不改属主的话
 /// 请求者读不到自己的恢复结果。
 ///
-/// 两条纪律,都是复审抓出来的:
+/// **入参是已校验的 fd,不是路径。** 这一点是复审两次才做对的:
 ///
-/// 1. **全程走 dirfd + `*at()`,绝不把完整路径交给特权系统调用。**
-///    原实现按路径递归,而 `lchown` 只对**末段**不跟随符号链接,中间分量
-///    照跟。加上 `ensure_under_home` 是纯词法判断(不解析符号链接),
-///    被监督方在自己 home 里放一条链接就能让落点的中间分量指向 home 之外
-///    ——一条任意本地用户可触发、无需竞态的 root 递归 chown 原语,
-///    可达 `/var/log/infinisec`(审计日志属主 → 反取证)、别人的 home、
-///    `/dev` 下的设备节点。闸设在词法层,而真正的落点由内核解析。
-/// 2. **根目录最后改。** 原实现先 chown 根再下钻:根一换属主就变成请求者
-///    可写(0700 属主换人 = 换人可写),之后的递归等于给他一个在遍历途中
-///    把子目录换成符号链接的窗口。
-fn chown_tree(root: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
+/// 第一版按路径递归,`lchown` 只对末段不跟随符号链接、中间分量照跟,
+/// 加上落点校验是纯词法的,于是被监督方在自己 home 里放一条链接就能让
+/// root 递归 chown 到 home 之外——审计日志、别人的 home、`/dev` 下的
+/// 设备节点都可达。
+///
+/// 第二版把**内部**遍历改成了 dirfd + `*at()`,但两个端点还是路径:
+/// `open(完整路径)` 打开根、结尾 `fchownat(AT_FDCWD, 完整路径)` 改根。
+/// `O_NOFOLLOW` 与 `AT_SYMLINK_NOFOLLOW` 都**只约束最终分量**,中间分量
+/// 由内核在每次调用时重新解析——所以原语一点没堵上,而注释和文档都写着
+/// 堵上了。校验与使用之间隔着整个 replay,窗口以秒计且可反复重试。
+///
+/// 现在:fd 由 `ensure_secure_dir_under` 在逐层校验时产出并直接传进来,
+/// 根用 `AT_EMPTY_PATH` 就地改,全程再没有完整路径字符串。
+/// 顺序仍是**根最后改**——根一换属主就变成请求者可写,先改根等于给他一个
+/// 在遍历途中换掉子目录的窗口。
+fn chown_tree(dir: &std::os::fd::OwnedFd, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
 
-    let c = CString::new(root.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "路径含 NUL"))?;
-    let fd = unsafe {
-        libc::open(
-            c.as_ptr(),
-            libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    chown_below(dir, uid, gid, 0)?;
+
+    // 根放最后。AT_EMPTY_PATH + 空路径 = "就是这个 fd 指向的东西",
+    // 不经任何路径解析。
+    let empty = std::ffi::CString::new("").unwrap();
+    if unsafe {
+        libc::fchownat(
+            dir.as_raw_fd(),
+            empty.as_ptr(),
+            uid,
+            gid,
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
         )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let dir = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
-
-    chown_below(&dir, uid, gid)?;
-
-    // 根放最后
-    if unsafe { libc::fchownat(libc::AT_FDCWD, c.as_ptr(), uid, gid, libc::AT_SYMLINK_NOFOLLOW) }
-        != 0
+    } != 0
     {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
 
+/// 递归深度上限。目录层数受调用方数据影响,而每层要占 2 个 fd
+/// (ReadDir 一个 + 子目录 fd 一个);systemd 默认 1024 的软上限意味着
+/// 五百来层就会 EMFILE,连带同进程里的判决线程一起遭殃。
+const CHOWN_MAX_DEPTH: usize = 64;
+
 /// 递归改 `dir` **之下**所有条目的属主。目录本身由调用方最后处理。
-fn chown_below(dir: &std::os::fd::OwnedFd, uid: u32, gid: u32) -> std::io::Result<()> {
+fn chown_below(
+    dir: &std::os::fd::OwnedFd,
+    uid: u32,
+    gid: u32,
+    depth: usize,
+) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::fd::AsRawFd;
 
-    // 用 fd 的副本建 ReadDir:read_dir 需要一个自己的 fd
-    let listing = std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))?;
-    for e in listing {
-        let e = e?;
-        let name = e.file_name();
-        let cname = CString::new(name.as_encoded_bytes()).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "文件名含 NUL")
-        })?;
-        // 先看它是不是目录——用 NOFOLLOW,符号链接就当普通条目处理
+    if depth >= CHOWN_MAX_DEPTH {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("恢复产物目录层数超过 {CHOWN_MAX_DEPTH},拒绝继续"),
+        ));
+    }
+
+    // 先把目录项名字收齐再递归:ReadDir 的 fd 若跨递归持有,每层会多占
+    // 一个 fd,深树直接打满进程的 fd 上限。
+    // `/proc/self/fd/N` 对 O_PATH fd 是 magic link,直接跳到已 pin 住的
+    // (dentry, vfsmount),不会按路径重走一遍——所以这一步不引入新的解析面。
+    let names: Vec<std::ffi::OsString> = {
+        let listing = std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))?;
+        let mut v = Vec::new();
+        for e in listing {
+            v.push(e?.file_name());
+        }
+        v
+    };
+
+    for name in names {
+        let cname = CString::new(name.as_encoded_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "文件名含 NUL"))?;
+        // 目录才递归。符号链接在这里会 ENOTDIR(O_NOFOLLOW + O_DIRECTORY),
+        // 于是跳过递归、只改链接自身。
         let sub = unsafe {
             libc::openat(
                 dir.as_raw_fd(),
@@ -1325,10 +1351,8 @@ fn chown_below(dir: &std::os::fd::OwnedFd, uid: u32, gid: u32) -> std::io::Resul
         if sub >= 0 {
             let subdir =
                 unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(sub) };
-            chown_below(&subdir, uid, gid)?;
+            chown_below(&subdir, uid, gid, depth + 1)?;
         }
-        // 非目录(或打不开)一律按条目本身处理;AT_SYMLINK_NOFOLLOW 保证
-        // 符号链接只改链接自己,不改它指向的东西
         if unsafe {
             libc::fchownat(dir.as_raw_fd(), cname.as_ptr(), uid, gid, libc::AT_SYMLINK_NOFOLLOW)
         } != 0
@@ -1608,9 +1632,12 @@ fn dispatch_control(
             // 由内核解析。所以先用 dirfd 链把整条路径逐层建立/校验(它对
             // home 之下的每一层都拒绝符号链接),再拿解析后的真实位置复核
             // 一次包含关系。这一步之后,后续的写入与改属主才谈得上安全。
-            if let Err(e) = quarantine::ensure_secure_dir_under(&home, &out) {
-                return ControlResponse::err(format!("输出目录不可用:{e}"));
-            }
+            // 保留它返回的 fd:后面 chown 就用这个已校验的 inode,
+            // 不再拿字符串路径去让内核重新解析一遍(见 chown_tree 的文档)。
+            let out_fd = match quarantine::ensure_secure_dir_under(&home, &out) {
+                Ok(fd) => fd,
+                Err(e) => return ControlResponse::err(format!("输出目录不可用:{e}")),
+            };
             match (out.canonicalize(), home.canonicalize()) {
                 (Ok(real_out), Ok(real_home)) if real_out.starts_with(&real_home) => {}
                 (Ok(real_out), Ok(_)) => {
@@ -1633,7 +1660,7 @@ fn dispatch_control(
                         // 得 sudo 才读得到自己的恢复结果。权限位保持不变
                         // (secrets/ 仍是 0700/0600),只改属主。
                         let gid = gid_of_uid(uid).unwrap_or(uid);
-                        if let Err(e) = chown_tree(&out, uid, gid) {
+                        if let Err(e) = chown_tree(&out_fd, uid, gid) {
                             eprintln!("infinisecd: ⚠ 恢复产物改属主失败: {e}");
                         }
                         ControlResponse::ok(vec![
@@ -1821,13 +1848,25 @@ fn dispatch_control(
             }
             ControlResponse::ok(lines)
         }
-        ControlRequest::BackupNow => {
+        ControlRequest::BackupNow { scope } => {
+            let scope = scope.map(PathBuf::from);
+            if let Some(sc) = &scope {
+                if !sc.is_absolute() {
+                    return ControlResponse::err("范围必须是绝对路径");
+                }
+            }
             let mut lines = Vec::new();
             for p in &policy.protect.paths {
                 let src = expand_home_str(p, &home);
                 // 只快照本用户 home 下的保护目录,且排除 infsec 自己的状态目录
                 if !is_snapshot_source(&src, &home) {
                     continue;
+                }
+                // 给了范围就只做那一条(它仍必须是保护集里的一条)
+                if let Some(sc) = &scope {
+                    if &src != sc {
+                        continue;
+                    }
                 }
                 let repo = snapshot::repo_root(&home).join(sanitize(&src));
                 // 必须用 ensure_secure_dir:create_dir_all 会跟随符号链接,

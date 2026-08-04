@@ -102,7 +102,7 @@ echo "$OUT" | sed 's/^/  /' | head -5
 # 没放行过 → 这一项这轮没有可测对象,报 SKIP。
 # (旧写法在 else 分支直接报 PASS:boundary 漏报边界时会被记成通过。)
 if [[ ! -e "$FIX/proj/a.txt" ]]; then
-    echo "$OUT" | grep -q '删除边界' \
+    echo "$OUT" | grep -q '删除边界(第一条被放行的删除)' \
         && chk PASS "有被放行的删除时 boundary 报出边界" || chk FAIL "有被放行的删除,boundary 却没报出边界"
     echo "$OUT" | grep -q '隔离区' \
         && chk PASS "边界结果指向隔离区(成本最低的恢复源)" || chk FAIL "缺隔离区指引"
@@ -142,7 +142,7 @@ note "④ 桌面通知配置在位(实际弹窗需要桌面会话,这里只验�
 asroot grep -q '^\[notify\]' "$POLICY" && chk PASS "策略含 [notify] 段" || chk FAIL "策略缺 notify 配置"
 # 触发一次拒绝,确认 daemon 不会因为通知失败而出错
 infsec run --profile interactive -- unlink "$FIX/proj/new.txt" >/dev/null 2>&1
-systemctl is-active infinisecd | grep -q active && chk PASS "通知路径不影响 daemon 稳定性" || chk FAIL "daemon 挂了"
+[[ "$(systemctl is-active infinisecd 2>/dev/null)" == active ]] && chk PASS "通知路径不影响 daemon 稳定性" || chk FAIL "daemon 挂了"
 
 # ---------- ⑤ 审计完整性 ----------
 note "⑤ 审计记录字段完整(事后能重建时间线)"

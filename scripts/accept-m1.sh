@@ -206,7 +206,7 @@ else
     chk PASS "kill daemon 无权限"
 fi
 infsec run -- /usr/bin/systemctl stop infinisecd >/dev/null 2>&1
-systemctl is-active infinisecd | grep -q active && chk PASS "systemctl stop 被签名层拦下" || chk FAIL "服务被停掉"
+[[ "$(systemctl is-active infinisecd 2>/dev/null)" == active ]] && chk PASS "systemctl stop 被签名层拦下" || chk FAIL "服务被停掉"
 
 # fail-closed:daemon 停止期间,被拦 syscall 必须失败
 ( sleep 5; asroot systemctl stop infinisecd ) &
@@ -221,7 +221,7 @@ MARK="$FIX/nodaemon.txt"
 infsec run -- touch "$MARK" >/dev/null 2>&1
 [[ -e $MARK ]] && chk FAIL "daemon 不可达时降级为无监督执行" || chk PASS "daemon 不可达时拒绝启动目标命令"
 asroot systemctl start infinisecd; sleep 1
-systemctl is-active infinisecd | grep -q active && echo "  (daemon 已恢复)"
+[[ "$(systemctl is-active infinisecd 2>/dev/null)" == active ]] && echo "  (daemon 已恢复)"
 pause "查审计与 journalctl -u infinisecd"
 
 # ---------------------------------------------------------------

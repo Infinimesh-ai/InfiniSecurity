@@ -79,7 +79,17 @@ pub enum ControlRequest {
     /// 备份态总览(PLAN 3.1):最近快照、离机副本、上次演练,缺项告警。
     BackupStatus,
     /// 立即对保护目录做一次快照。
-    BackupNow,
+    /// 立即快照。`scope` 给定时**只**快照该路径(必须是保护集里的一条),
+    /// 不给则遍历整个保护集。
+    ///
+    /// 加这个参数不只是为了顺手:M4 验收调 `backup now` 时会连带让 root
+    /// 把被监督用户的 `~/Documents`、`~/.ssh`、`~/.gnupg` 全部复制进快照仓库
+    /// ——而 AGENTS.md 纪律 3 明确写着"测试进程不得拥有触碰 ~/Documents 的
+    /// 权限"。有了范围参数,验收才能只碰自己现造的 fixture。
+    BackupNow {
+        #[serde(default)]
+        scope: Option<String>,
+    },
     /// 恢复演练:从最近快照实际恢复到临时目录并逐文件验哈希。
     Drill { source: String },
     /// 取证恢复向导:某阶段(或全部阶段)的检查清单。

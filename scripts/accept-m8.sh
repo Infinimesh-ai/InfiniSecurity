@@ -172,11 +172,11 @@ PYEOF
 
 OUT=$(infsec recover replay "$FIX/replay-out" "$FIX/sessions" 2>&1)
 echo "$OUT" | sed 's/^/  /' | head -4
-echo "$OUT" | grep -q '重建文件 2' && chk PASS "重建 2 个文件(Edit 类正确跳过)" || chk FAIL "重建数不对"
+echo "$OUT" | grep -q '重建文件 2 个' && chk PASS "重建 2 个文件(Edit 类正确跳过)" || chk FAIL "重建数不对"
 
 MAIN=$(asroot cat "$FIX/replay-out/files/proj/src/main.rs" 2>/dev/null)
 echo "$MAIN" | grep -q 'v2-final' && chk PASS "取的是最后已知内容(v2 覆盖 v1)" || chk FAIL "内容不是最新版"
-asroot test -f "$FIX/replay-out/files/proj/lib.rs" 2>/dev/null && chk FAIL "Edit 类被错误重放" || chk PASS "Edit 类未被重放(只知差异重建不出完整文件)"
+asroot test -f "$FIX/replay-out/files/proj/src/lib.rs" 2>/dev/null && chk FAIL "Edit 类被错误重放" || chk PASS "Edit 类未被重放(只知差异重建不出完整文件)"
 
 note "⑥ 秘密必须隔离,不能进普通交付物"
 asroot test -f "$FIX/replay-out/secrets/proj/.env" 2>/dev/null && chk PASS ".env 落在 secrets/ 独立目录" || chk FAIL "秘密未隔离"

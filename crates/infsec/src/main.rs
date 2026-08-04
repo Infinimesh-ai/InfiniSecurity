@@ -41,10 +41,13 @@ fn usage() -> ! {
     eprintln!("  infsec frozen                列出被冻结的进程");
     eprintln!("  infsec thaw                  人工确认后解冻");
     eprintln!("  infsec backup status         快照/离机副本/演练三项检查,缺项告警");
-    eprintln!("  infsec backup now            立即对保护目录做增量快照");
+    eprintln!("  infsec backup now [路径]     立即增量快照;给路径则只做那一条");
     eprintln!("  infsec drill <保护目录>      从最近快照实际恢复并逐文件验哈希");
     eprintln!("  infsec audit [--verdict V] [--path P] [--limit N] [--all]");
-    eprintln!("                               审计查询");
+    eprintln!("                               审计查询。--verdict 按**层**匹配:");
+    eprintln!("                               allow 覆盖 allow / allow-quarantined,");
+    eprintln!("                               observe 覆盖全部 observe-*;deny 只有 deny。");
+    eprintln!("                               (真正被放行的删除记在 allow-quarantined)");
     eprintln!("  infsec boundary              找出删除边界(第一条被放行的删除)");
     eprintln!("  infsec unlock <操作> <绝对路径>  人工带外解锁(必须在真终端交互)");
     eprintln!("  infsec lsm status            系统级 eBPF LSM 层状态");
@@ -195,7 +198,7 @@ fn real_main() -> Result<()> {
         Some("backup") => {
             return match argv.get(2).map(String::as_str) {
                 Some("status") => control(ControlRequest::BackupStatus),
-                Some("now") => control(ControlRequest::BackupNow),
+                Some("now") => control(ControlRequest::BackupNow { scope: argv.get(3).cloned() }),
                 _ => usage(),
             }
         }

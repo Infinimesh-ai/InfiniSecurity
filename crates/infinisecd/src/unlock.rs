@@ -283,7 +283,8 @@ pub fn query_audit(path: &std::path::Path, q: &AuditQuery) -> Result<Vec<String>
             continue;
         };
         if let Some(want) = &q.verdict {
-            if v.get("verdict").and_then(|x| x.as_str()) != Some(want.as_str()) {
+            let actual = v.get("verdict").and_then(|x| x.as_str()).unwrap_or("");
+            if !verdict_matches(actual, want) {
                 continue;
             }
         }
@@ -346,6 +347,23 @@ fn format_audit_line(v: &serde_json::Value) -> String {
         subject,
         get("rule")
     )
+}
+
+/// 判决标签是**分层**的,用 `-` 连接:`allow` / `allow-quarantined`、
+/// `observe-would-allow` / `observe-would-deny` …… 所以过滤要按层匹配,
+/// 不能只比字面相等。
+///
+/// 为什么要紧:审计里 `allow-quarantined` 才是真正被放行的删除
+/// (VM 上实测 5031 条),而 `allow` 基本只有 execve。事故排查时
+/// "给我看放行了什么"是最自然的查询,精确相等会让它一条删除都查不到,
+/// 还给出一个看起来正常的空结果——这与 `deletion_boundary` 那次漏改
+/// 是同一类问题,只是发生在查询侧。
+///
+/// 规则:`want` 完全相等,或 `actual` 是 `want` 的下一层(`want-` 开头)。
+/// 于是 `--verdict allow` 覆盖 allow 与 allow-quarantined,
+/// `--verdict observe` 覆盖全部 observe-*,而 `--verdict deny` 仍然只有 deny。
+fn verdict_matches(actual: &str, want: &str) -> bool {
+    actual == want || actual.starts_with(&format!("{want}-"))
 }
 
 /// 找出"删除边界":第一条被实际放行的删除(PLAN 3.1)。
@@ -531,6 +549,30 @@ mod tests {
     /// 这条以前是假绿灯:它按 `nth(5)` 取字段(那是 tpgid 不是 tty_nr),
     /// 拿到 `-1`,`-1 != 0` 于是走进 `Ok(())` 分支并"断言通过",
     /// 正好掩盖了门禁恒不生效。现在方向改对:必须 `Err`。
+    /// 回归:判决标签是分层的,过滤必须按层匹配。
+    ///
+    /// VM 实测:审计里 5031 条 `allow-quarantined`(真正的删除)对
+    /// `--verdict allow` **一条都查不到**,只返回 execve 的 `allow`。
+    /// 事故排查时这是最自然的查询,精确相等会给出一个看起来正常的空结果。
+    #[test]
+    fn verdict_filter_matches_by_layer() {
+        // 上层覆盖下层
+        assert!(verdict_matches("allow", "allow"));
+        assert!(verdict_matches("allow-quarantined", "allow"));
+        assert!(verdict_matches("observe-would-allow", "observe"));
+        assert!(verdict_matches("observe-would-deny", "observe"));
+        assert!(verdict_matches("observe-would-allow", "observe-would-allow"));
+        // 不能跨层误配
+        assert!(!verdict_matches("allow", "allow-quarantined"));
+        assert!(!verdict_matches("deny", "allow"));
+        assert!(!verdict_matches("allow-quarantined", "deny"));
+        // 不能只按前缀字符匹配(allowance 不是 allow 的下一层)
+        assert!(!verdict_matches("allowance", "allow"));
+        // deny 仍然只有 deny
+        assert!(verdict_matches("deny", "deny"));
+        assert!(!verdict_matches("observe-would-deny", "deny"));
+    }
+
     /// 回归:observe 模式下的放行必须计入删除边界。
     ///
     /// observe 的契约是"一律放行、只记审计",所以 observe-would-* 记录

@@ -4,6 +4,9 @@
 # 纪律自检(AGENTS.md 纪律 1/4):本脚本只在 $HOME/infsec-m4-fixture-<pid>
 #   下创建与修改自己造的文本文件,快照落在 ~/.infinisec/snapshots 的
 #   **本 fixture 自己那个仓**里;⑥ 的"篡改"也只写这个仓。
+#   `backup now` 一律带 "$FIX" 范围参数:不带范围时它会遍历整个保护集,
+#   连带让 root 把 ~/Documents、~/.ssh、~/.gnupg 复制进快照仓——那与
+#   纪律 3"测试进程不得触碰 ~/Documents"直接冲突(复审抓到过)。
 #   全脚本不含 rm / dd / mkfs / truncate / shred / git clean / find -delete;
 #   清理只用 unlink/rmdir。root 侧只做两件事:给策略加一行 fixture 路径、
 #   重启 infinisecd(trap 里撤销),不删任何数据。
@@ -68,12 +71,12 @@ note "① backup status:缺项必须告警,不能沉默"
 OUT=$(infsec backup status 2>&1)
 echo "$OUT" | grep -A4 "$FIX" | head -5 | sed 's/^/  /'
 echo "$OUT" | grep -q '从未建立快照' && chk PASS "无快照时告警" || chk FAIL "无快照未告警"
-echo "$OUT" | grep -q '离机副本' && chk PASS "无离机副本时告警(硬链接快照同盘,防不了磁盘故障)" || chk FAIL "缺离机副本未告警"
+echo "$OUT" | grep -q '没有离机副本' && chk PASS "无离机副本时告警(硬链接快照同盘,防不了磁盘故障)" || chk FAIL "缺离机副本未告警"
 echo "$OUT" | grep -q '恢复演练' && chk PASS "从未演练时告警" || chk FAIL "未演练未告警"
 
 # ---------- ② 建快照 ----------
 note "② backup now:首次全量快照"
-OUT=$(infsec backup now 2>&1)
+OUT=$(infsec backup now "$FIX" 2>&1)
 echo "$OUT" | grep "$FIX" | sed 's/^/  /'
 # 只看本 fixture 自己的快照仓库(仓库按源路径分仓);
 # ~/Documents 等默认保护目录也有快照,混进来会看错对象。
@@ -91,9 +94,9 @@ SNAPDIR=$(find "$REPO" -maxdepth 1 -type d -name '2*Z' 2>/dev/null | sort | head
 # ---------- ③ 增量:硬链接复用 ----------
 note "③ 第二份快照:只有改动的文件被复制,其余硬链接复用"
 echo "content-v2-CHANGED" > "$FIX/src/a.txt"
-OUT=$(infsec backup now 2>&1)
+OUT=$(infsec backup now "$FIX" 2>&1)
 echo "$OUT" | grep "$FIX" | sed 's/^/  /'
-echo "$OUT" | grep -qE '复制 1' && chk PASS "只复制了改动的 1 个文件" || chk FAIL "增量判断不对"
+echo "$OUT" | grep -qE '复制 1,' && chk PASS "只复制了改动的 1 个文件" || chk FAIL "增量判断不对"
 echo "$OUT" | grep -qE '硬链接复用 [1-9]' && chk PASS "未改动文件走硬链接复用" || chk FAIL "没有复用"
 
 # mapfile + 份数检查:两份快照是下面每一条断言的前置条件。
@@ -126,7 +129,7 @@ RESTORED=$(echo "$OUT" | grep '恢复到:' | sed 's/.*恢复到: //')
 note "⑤ 演练后 backup status 不再报"从未演练""
 OUT=$(infsec backup status 2>&1)
 echo "$OUT" | grep -A3 "$FIX" | grep -q '从未' && chk FAIL "演练记录未生效" || chk PASS "演练记录已计入"
-echo "$OUT" | grep -A3 "$FIX" | grep -q '离机副本' && chk PASS "离机副本仍在催(fixture 无 git 远端)" || chk FAIL "离机副本告警消失了"
+echo "$OUT" | grep -A3 "$FIX" | grep -q '没有离机副本' && chk PASS "离机副本仍在催(fixture 无 git 远端)" || chk FAIL "离机副本告警消失了"
 
 # ---------- ⑥ 损坏检出 ----------
 note "⑥ 快照损坏必须被演练检出(不能报"通过")"
