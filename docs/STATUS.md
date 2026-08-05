@@ -1,26 +1,27 @@
 # 项目状态(2026-07-31)
 
-**M0–M8 全部完成。2026-08-04 在验收机上完成加固后全量重跑:
-154 PASS / 0 FAIL / 3 SKIP,八个脚本退出码全为 0。**
+**M0–M8 全部完成。2026-08-05 验收机全量:210 PASS / 0 FAIL / 6 SKIP,
+八个脚本退出码全为 0。**
 
 > **2026-08-01–04:完成一次对抗性安全审计 + 加固 + VM 全量验收。
-> 修掉 50 余处缺陷,单测 149 → 217。eBPF 改动已在验收机上编译并**通过内核
+> 修掉 50 余处缺陷,单测 149 → 218,验收 151 → 210。eBPF 改动已在验收机上编译并**通过内核
 > verifier**。VM 实测又抓出三处开发机测不出的回归(见"第三轮"节)。
 
-| 里程碑 | 内容 | 加固后重跑(2026-08-04) | 报告 |
-|---|---|---|---|
-| M1 | seccomp 监督器 MVP | 33 PASS / 0 FAIL | [M1-ACCEPTANCE.md](M1-ACCEPTANCE.md) |
-| M2 | 风险分级 + 二审通道 + 合并判决 + 隔离区 | 15 PASS / 0 FAIL | [M2-ACCEPTANCE.md](M2-ACCEPTANCE.md) |
-| M3 | 爆发检测 + panic 应急止损 | 10 PASS / 0 FAIL / 2 SKIP | [M3-ACCEPTANCE.md](M3-ACCEPTANCE.md) |
-| M4 | 快照守护 + drill 恢复演练 | 18 PASS / 0 FAIL | [M4-ACCEPTANCE.md](M4-ACCEPTANCE.md) |
-| M5 | 引导式取证恢复(三层只读门禁) | 15 PASS / 0 FAIL | [M5-ACCEPTANCE.md](M5-ACCEPTANCE.md) |
-| M6 | eBPF LSM 系统级 anti-tamper | 19 PASS / 0 FAIL / 1 SKIP | [M6-ACCEPTANCE.md](M6-ACCEPTANCE.md) |
-| M7 | 审计、通知与人工解锁 | 21 PASS / 0 FAIL | [M7-ACCEPTANCE.md](M7-ACCEPTANCE.md) |
-| M8 | 企业镜像 + 会话重放恢复 | 23 PASS / 0 FAIL | [M8-ACCEPTANCE.md](M8-ACCEPTANCE.md) |
+| 里程碑 | 内容 | 补覆盖后(2026-08-05) | 加固前 | 报告 |
+|---|---|---|---|---|
+| M1 | seccomp 监督器 MVP | 44 PASS / 0 FAIL | 31 | [M1-ACCEPTANCE.md](M1-ACCEPTANCE.md) |
+| M2 | 风险分级 + 二审 + 合并判决 + 隔离区 | 30 PASS / 0 FAIL | 15 | [M2-ACCEPTANCE.md](M2-ACCEPTANCE.md) |
+| M3 | 爆发检测 + panic 应急止损 | 17 PASS / 0 FAIL / 1 SKIP | 12 | [M3-ACCEPTANCE.md](M3-ACCEPTANCE.md) |
+| M4 | 快照守护 + drill 恢复演练 | 33 PASS / 0 FAIL / 5 SKIP | 18 | [M4-ACCEPTANCE.md](M4-ACCEPTANCE.md) |
+| M5 | 引导式取证恢复(三层只读门禁) | 15 PASS / 0 FAIL | 15 | [M5-ACCEPTANCE.md](M5-ACCEPTANCE.md) |
+| M6 | eBPF LSM 系统级 anti-tamper | 27 PASS / 0 FAIL | 16 | [M6-ACCEPTANCE.md](M6-ACCEPTANCE.md) |
+| M7 | 审计、通知与人工解锁 | 21 PASS / 0 FAIL | 21 | [M7-ACCEPTANCE.md](M7-ACCEPTANCE.md) |
+| M8 | 企业镜像 + 会话重放恢复 | 23 PASS / 0 FAIL | 23 | [M8-ACCEPTANCE.md](M8-ACCEPTANCE.md) |
 
-条目数比加固前多(M1 31→33、M6 16→19):空洞断言被拆成 PASS/FAIL/**SKIP**
-三态,并补了"该次拦截由 infsec 层判 deny(审计可证)"这类归因断言。
-3 个 SKIP 是如实报告的未覆盖项,不计入 PASS。
+条目数几乎翻倍,原因有三:空洞断言被拆成 PASS/FAIL/**SKIP** 三态;
+补了"该次拦截由 infsec 层判 deny(审计可证)"这类**归因**断言;
+以及第七轮把"改了但没验收覆盖"的清单补掉。
+6 个 SKIP 是如实报告的未覆盖项(并发窗口没命中等),不计入 PASS。
 
 单元测试 218 个(纯逻辑,开发机可跑);验收测试全部在虚拟机上以真实
 双用户布局执行,样本一律无害。
@@ -74,7 +75,7 @@ VM 实测暴露的问题,开发机单测一个也覆盖不到。按危险程度�
 
 对 M1–M8 全量代码做了一次对抗性审计(多路独立审查 + 逐条推翻验证),
 修掉 50 余处缺陷(含对加固本身复审抓出的 9 + 6 + 6 处、VM 实测抓出的 3 处、
-复审共五轮 20 个面全部跑完)。单测从 149 增至 217,连跑稳定。
+复审共五轮 20 个面全部跑完)。单测从 149 增至 218,连跑稳定。
 
 **审计暴露的最要命的一类**:功能写了、单测绿了、文档写了,**但没接上线**。
 `assert_write_allowed`、`command_forbidden`、`check_reintegration`、
