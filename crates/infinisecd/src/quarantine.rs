@@ -28,32 +28,42 @@
 //!    覆盖一次就等于隔离区里静默少一份。所以落盘一律走
 //!    `renameat2(RENAME_NOREPLACE)` / `O_EXCL`,撞名就换名(`.1`、`.2`…)。
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::ffi::{CStr, CString};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
-// 已知缺口:**隔离副本仍可被原属主改写**。
+// 隔离副本的封存与保真回填(2026-08-07,补上此前记录在案的缺口)。
 //
-// `rename` 不改 inode,所以移进隔离区的文件仍是被监督用户属主、保留原 mode。
-// 目录侧是 root 属主(删不掉、也加不进新条目),但文件本身他还写得动——
-// 于是"放行的删除一定能找回"这个前提有一道裂缝:副本可以被事后清零,
-// 而 `infsec quarantine list` 仍如实列出该条目,比直接删掉更迷惑人。
-// 两层都接不住:内核层只挂了 path_unlink / path_rmdir,没有写钩子;
-// seccomp 层的 openat 只在带 O_TRUNC 时才上交判决,而未受监督的普通 shell
-// 根本不在 seccomp 之下。
+// 背景:`rename` 不改 inode,移进隔离区的文件原本仍是被监督用户属主、
+// 保留原 mode——副本可以被原属主事后清零,而 `quarantine list` 仍如实
+// 列出该条目,比直接删掉更迷惑人。第一次修复直接 `lchown(root)+chmod(0440)`,
+// 堵住了篡改,但**破坏了 restore 保真度**(VM 实测:恢复回去的文件仍是
+// root:root 0440,M2 验收 `cat: Permission denied`),因此被撤回。
 //
-// 试过的修法与它为什么被撤回:落盘后立刻 `lchown(root)` + `chmod(0440)`
-// 把副本封存。功能上确实堵住了,但**破坏了 restore 的保真度**——恢复回去
-// 的文件仍是 root:root 0440,用户拿回了自己的数据却读不了也改不了
-// (VM 实测:M2 的 restore 校验直接 `cat: Permission denied`,连带两项
-// 后续断言一起挂)。要做对必须同时记录并回填原始 uid/gid/mode,那是一份
-// 每批次的旁挂清单,属于独立的一块工作。
+// 现在的做法是三步,顺序本身就是安全设计:
 //
-// 在那之前,这里保持**不动副本的属主与权限**:恢复保真度是产品的核心承诺,
-// 一个坏掉的 restore 比一个记录在案的缺口更糟。
-// 该缺口已列入 docs/STATUS.md。
+// 1. **先记账**:每批次一份旁挂清单 [`MANIFEST_NAME`](root 属主),逐条
+//    记录落点、原路径、原始 uid/gid/mode 与类型。清单写不进去就把原件
+//    移回原位并拒绝放行(fail-closed)——没有账就没有保真恢复,宁可不删。
+// 2. **再封存**:副本 chown 给 root、去掉全部写权限。可读性跟随原属主:
+//    原属主的读(目录再加执行)位迁移到**属主的主组**上(0440/0550),
+//    原本连属主都读不到的封成 0400,只有 root 能看。这样"用户手工翻
+//    隔离区找回文件"这条路保持通畅(第三轮教训:把用户挡在自己备份
+//    外面是恢复工具最糟的失败方向);在 user-private-group 的常规布局下,
+//    组读恰好只等于原属主本人。封存经 `O_PATH|O_NOFOLLOW` fd +
+//    `/proc/self/fd` 作用于 inode,绝不跟随符号链接(纪律 6);
+//    符号链接条目只 lchown、不 chmod;FIFO/socket/设备不封存
+//    (内容不落盘,没有篡改面),只记账。
+// 3. **恢复时回填**:restore 在 rename **之前**拿住源条目的 O_PATH fd,
+//    rename 成功后按清单经同一个 fd 回填 uid/gid/mode——fd 指向 inode,
+//    与路径无关,不存在"回填到别的文件"的窗口。没有清单条目的遗留批次
+//    照旧恢复、不动元数据(向后兼容)。
+//
+// 仍然记录在案的缺口:批次内的中间目录是 0755 root,源目录自身的 mode
+// (如 0700 的 secrets/)没有随路径保留——文件内容已由封存保护,
+// 但条目**名字**对本机其他用户可见。见 docs/STATUS.md。
 
 /// 撞名去重的上限。超过这个数只能是出了别的问题,宁可报错也不覆盖。
 const DEDUP_LIMIT: usize = 100;
@@ -275,6 +285,248 @@ fn fstat(fd: &OwnedFd) -> std::io::Result<libc::stat> {
 }
 
 // ---------------------------------------------------------------------------
+// 旁挂清单与封存(设计见文件头部注释)
+// ---------------------------------------------------------------------------
+
+/// 每批次的元数据清单文件名。位于批次目录顶层,root 属主。
+///
+/// 名字以 `.infsec-` 开头是刻意的:被隔离条目的落点 = 批次目录 + 原始
+/// 绝对路径去掉前导 `/`,只有原始路径恰为 `/.infsec-meta.jsonl` 时才可能
+/// 撞名——在 `/` 下建文件本来就只有 root 能做,且 [`preserve`]/[`restore`]
+/// 都显式拒绝这个名字(纵深第二道)。
+pub const MANIFEST_NAME: &str = ".infsec-meta.jsonl";
+
+/// 清单里的一条记录:一个被隔离条目的"删除前真身"。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct MetaRecord {
+    /// 批次目录下的相对落点(含撞名去重后缀,如 `home/dev/f.txt.1`)。
+    landed: String,
+    /// 原始绝对路径。
+    original: String,
+    uid: u32,
+    gid: u32,
+    /// 权限位(`st_mode & 0o7777`)。
+    mode: u32,
+    /// `file` / `dir` / `symlink` / `other`。
+    kind: String,
+}
+
+/// 落盘前捕获的条目元数据。必须在 rename **之前**取:移走之后原路径上
+/// 已经没有它了。
+struct EntryMeta {
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    kind: &'static str,
+}
+
+fn capture_meta(p: &Path) -> Result<EntryMeta> {
+    use std::os::unix::fs::MetadataExt as _;
+    let md = std::fs::symlink_metadata(p)
+        .with_context(|| format!("读取 {} 元数据失败", p.display()))?;
+    let ft = md.file_type();
+    let kind = if ft.is_file() {
+        "file"
+    } else if ft.is_dir() {
+        "dir"
+    } else if ft.is_symlink() {
+        "symlink"
+    } else {
+        "other"
+    };
+    Ok(EntryMeta {
+        uid: md.uid(),
+        gid: md.gid(),
+        mode: md.mode() & 0o7777,
+        kind,
+    })
+}
+
+/// 追加一条清单记录并落盘。
+///
+/// `O_NOFOLLOW` 是习惯性防御:批次目录是 root 属主,被监督用户本就放不进
+/// 符号链接,但这里是 root 的写路径,便宜的检查不省。
+fn append_manifest(batch: &Path, rec: &MetaRecord) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let line = serde_json::to_string(rec).context("序列化清单记录失败")?;
+    let path = batch.join(MANIFEST_NAME);
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .with_context(|| format!("打开清单 {} 失败", path.display()))?;
+    writeln!(f, "{line}").with_context(|| format!("写入清单 {} 失败", path.display()))?;
+    // 清单是恢复保真度的账本:副本已经封存而账没落盘,等于白封
+    f.sync_data()
+        .with_context(|| format!("清单 {} 落盘失败", path.display()))?;
+    Ok(())
+}
+
+/// 按落点相对路径查清单。同键多条时取最后一条(不该发生,防御性选择)。
+/// 清单缺失或个别行损坏都按"没有记录"处理——遗留批次必须照常恢复。
+fn manifest_lookup(batch: &Path, landed_rel: &str) -> Option<MetaRecord> {
+    let data = std::fs::read_to_string(batch.join(MANIFEST_NAME)).ok()?;
+    let mut hit = None;
+    for line in data.lines() {
+        if let Ok(r) = serde_json::from_str::<MetaRecord>(line) {
+            if r.landed == landed_rel {
+                hit = Some(r);
+            }
+        }
+    }
+    hit
+}
+
+/// `uid` 的主组(passwd 的 pw_gid)。封存后的组读位挂在这上面:
+/// 在 user-private-group 布局下它恰好只等于原属主本人;查不到就不给组读。
+fn primary_gid_of(uid: u32) -> Option<u32> {
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = [0u8; 4096];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut pwd,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc == 0 && !result.is_null() {
+        Some(pwd.pw_gid)
+    } else {
+        None
+    }
+}
+
+fn open_opath_nofollow(p: &Path) -> std::io::Result<OwnedFd> {
+    let c = cpath(p)?;
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd >= 0 且刚由 open 创建,所有权在此转移。
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// 经 `/proc/self/fd/<n>` 把 chown/chmod 作用到 fd 指向的 **inode** 上。
+///
+/// chmod(2) 没有"不跟随符号链接"的 fd 变体,这条 magic link 是标准做法:
+/// fd 由 `O_PATH|O_NOFOLLOW` 打开,之后路径怎么变都影响不了它指向谁——
+/// "检查过的就是改到的那一个"。
+fn apply_via_fd(fd: &OwnedFd, owner: Option<(u32, u32)>, mode: Option<u32>) -> std::io::Result<()> {
+    let proc_path = CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+        .expect("proc 路径不含 NUL");
+    if let Some((u, g)) = owner {
+        if unsafe { libc::chown(proc_path.as_ptr(), u, g) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    if let Some(m) = mode {
+        if unsafe { libc::chmod(proc_path.as_ptr(), m as libc::mode_t) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn lchown(p: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    let c = cpath(p)?;
+    if unsafe { libc::lchown(c.as_ptr(), uid, gid) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// 封存一个已落盘的隔离条目:root 属主、去写权限、原属主经主组保读。
+///
+/// 非 root(单测)时跳过 chown——mode 部分照常生效,断言仍有牙。
+/// 封存后的权限位:去全部写位,原属主的读(+目录执行)位迁移到主组。
+fn sealed_bits(kind: &str, orig_mode: u32, has_group: bool) -> u32 {
+    let (base, gmask) = if kind == "dir" { (0o500, 0o050) } else { (0o400, 0o040) };
+    let g = if has_group {
+        ((orig_mode & 0o700) >> 3) & gmask
+    } else {
+        0
+    };
+    base | g
+}
+
+fn seal_entry(landed: &Path, meta: &EntryMeta) -> std::io::Result<()> {
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let group = primary_gid_of(meta.uid);
+    match meta.kind {
+        "file" | "dir" => {
+            let fd = open_opath_nofollow(landed)?;
+            let owner = if is_root { Some((0, group.unwrap_or(0))) } else { None };
+            apply_via_fd(&fd, owner, Some(sealed_bits(meta.kind, meta.mode, group.is_some())))
+        }
+        "symlink" => {
+            // 链接自身没有有意义的 mode;lchown 不跟随链接、不碰目标。
+            if is_root {
+                lchown(landed, 0, group.unwrap_or(0))
+            } else {
+                Ok(())
+            }
+        }
+        _ => Ok(()), // FIFO/socket/设备:内容不落盘,没有篡改面
+    }
+}
+
+/// 落盘之后的收尾:先记账,再封存。
+///
+/// 返回 Err 当且仅当**清单没写成**——那时调用方必须撤销落盘并拒绝放行
+/// (没有账就没有保真恢复)。封存失败只警告:未封存的副本仍然可恢复,
+/// 坏的是防篡改,不是数据;方向选"数据在"而不是"锁得紧"。
+fn finalize_entry(batch: &Path, landed: &Path, original: &Path, meta: &EntryMeta) -> Result<()> {
+    let rel = landed
+        .strip_prefix(batch)
+        .map_err(|_| anyhow!("落点 {} 不在批次目录 {} 下", landed.display(), batch.display()))?;
+    let rec = MetaRecord {
+        landed: rel.to_string_lossy().into_owned(),
+        original: original.to_string_lossy().into_owned(),
+        uid: meta.uid,
+        gid: meta.gid,
+        mode: meta.mode,
+        kind: meta.kind.to_string(),
+    };
+    append_manifest(batch, &rec)?;
+    if let Err(e) = seal_entry(landed, meta) {
+        eprintln!(
+            "[infinisecd] 警告:封存隔离副本 {} 失败:{e};副本未封存,恢复不受影响",
+            landed.display()
+        );
+    }
+    Ok(())
+}
+
+/// restore 成功改名之后,按清单回填原始元数据。
+///
+/// `fd` 是 rename 之前从隔离区一侧拿住的 O_PATH fd(file/dir 才有);
+/// 回填作用于它指向的 inode,与目标路径无关。
+fn replay_meta(rec: &MetaRecord, fd: Option<&OwnedFd>, dest: &Path) -> Result<()> {
+    let is_root = unsafe { libc::geteuid() } == 0;
+    match rec.kind.as_str() {
+        "file" | "dir" => {
+            let fd = fd.context("回填缺少条目 fd")?;
+            let owner = if is_root { Some((rec.uid, rec.gid)) } else { None };
+            apply_via_fd(fd, owner, Some(rec.mode)).map_err(|e| anyhow!(e))
+        }
+        "symlink" => {
+            if is_root {
+                lchown(dest, rec.uid, rec.gid).map_err(|e| anyhow!(e))
+            } else {
+                Ok(())
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 入参校验
 // ---------------------------------------------------------------------------
 
@@ -460,7 +712,6 @@ fn copy_no_clobber(src: &Path, dest: &Path) -> Result<PathBuf> {
 
     let mut input = std::fs::File::open(src)
         .with_context(|| format!("打开 {} 失败", src.display()))?;
-    let meta = input.metadata()?;
 
     for n in 0..=DEDUP_LIMIT {
         let cand = if n == 0 {
@@ -477,12 +728,9 @@ fn copy_no_clobber(src: &Path, dest: &Path) -> Result<PathBuf> {
             Ok(mut out) => {
                 std::io::copy(&mut input, &mut out)
                     .with_context(|| format!("复制 {} 到隔离区失败", src.display()))?;
-                // 复制路径本来就是 root 属主(daemon 创建的),但仍要封成
-                // 只读:与 rename 路径保持同一条不变式——**隔离副本谁都
-                // 写不动**。原来这里按原件的 mode 放开权限位,若原件是 0644
-                // 就又变成属主可写了(属主是 root,可 root 出问题时同样麻烦),
-                // 而且与 rename 路径的语义不一致。
-                std::fs::set_permissions(&cand, meta.permissions()).ok();
+                // 最终权限由调用方的 finalize_entry → seal_entry 统一设置
+                // (与 rename 路径同一条不变式:隔离副本谁都写不动),
+                // 这里保持创建时的 0600 即可。
                 return Ok(cand);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -509,28 +757,61 @@ fn copy_no_clobber(src: &Path, dest: &Path) -> Result<PathBuf> {
 /// 里多出一个带后缀的名字,也不能让前一份副本被悄悄盖掉。
 pub fn preserve(home: &Path, victim: &Path, stamp: &str) -> Result<Preserved> {
     ensure_no_traversal(victim)?;
-    let dest = batch_dir(home, stamp)?.join(victim.strip_prefix("/").unwrap_or(victim));
+    let batch = batch_dir(home, stamp)?;
+    let rel = victim.strip_prefix("/").unwrap_or(victim);
+    if rel.as_os_str() == MANIFEST_NAME {
+        bail!("{} 与批次元数据清单同名,拒绝隔离", victim.display());
+    }
+    let dest = batch.join(rel);
     let parent = dest.parent().context("隔离目标没有父目录")?;
     // 可信基取 home:home 之上的符号链接是管理员布局(独立盘/加密 home),
     // home 之下的才是被监督方摆布得了的,必须逐层查。
     ensure_secure_dir_under(home, parent)
         .with_context(|| format!("创建隔离目录 {} 失败", parent.display()))?;
     ensure_under_quarantine(home, &dest)?;
+    // rename 之前捕获"删除前真身":移走之后原路径上已经没有它了
+    let meta = capture_meta(victim)?;
 
     match move_no_clobber(victim, &dest) {
-        Ok(landed) => Ok(Preserved::Moved(landed)),
+        Ok(landed) => {
+            if let Err(e) = finalize_entry(&batch, &landed, victim, &meta) {
+                // 清单没写成 = 保真恢复没有账。把原件移回去、拒绝放行;
+                // 连移回都失败(原路径瞬间被占等极端情形)才退而求其次:
+                // 副本保持未封存 + 大声警告——数据在,坏的只是防篡改。
+                match rename_noreplace(&landed, victim) {
+                    Rename2::Done => bail!(
+                        "隔离清单写入失败({e:#}),已把 {} 移回原位并拒绝放行",
+                        victim.display()
+                    ),
+                    _ => eprintln!(
+                        "[infinisecd] 警告:隔离清单写入失败({e:#}),且 {} 无法移回原位;\
+                         副本保持未封存以保证可恢复",
+                        victim.display()
+                    ),
+                }
+            }
+            Ok(Preserved::Moved(landed))
+        }
         Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
             // 跨文件系统:复制成功才放行,失败就拒绝。
-            let meta = std::fs::symlink_metadata(victim)?;
-            if meta.is_dir() {
+            if meta.kind == "dir" {
                 // rmdir 只作用于空目录,没有内容需要保全
                 ensure_secure_dir(&dest)?;
+                if let Err(e) = finalize_entry(&batch, &dest, victim, &meta) {
+                    let _ = std::fs::remove_dir(&dest);
+                    bail!("隔离清单写入失败,拒绝放行:{e:#}");
+                }
                 return Ok(Preserved::Copied(dest));
             }
-            if !meta.is_file() {
+            if meta.kind != "file" {
                 bail!("{} 不是常规文件且跨文件系统,无法保全", victim.display());
             }
             let landed = copy_no_clobber(victim, &dest)?;
+            if let Err(e) = finalize_entry(&batch, &landed, victim, &meta) {
+                // 原件还在(复制路径不动原件),删掉半成品副本、拒绝放行
+                let _ = std::fs::remove_file(&landed);
+                bail!("隔离清单写入失败,拒绝放行:{e:#}");
+            }
             Ok(Preserved::Copied(landed))
         }
         Err(e) => bail!("移入隔离区失败: {e}"),
@@ -545,18 +826,28 @@ pub fn snapshot(home: &Path, victim: &Path, stamp: &str) -> Result<PathBuf> {
     ensure_no_traversal(victim)?;
     // 先校验入参再碰文件系统:批次戳不合法就没有任何理由去 stat 目标
     let batch = batch_dir(home, stamp)?;
-    let meta = std::fs::symlink_metadata(victim)
-        .with_context(|| format!("读取 {} 元数据失败", victim.display()))?;
-    if !meta.is_file() {
+    let rel = victim.strip_prefix("/").unwrap_or(victim);
+    if rel.as_os_str() == MANIFEST_NAME {
+        bail!("{} 与批次元数据清单同名,拒绝快照", victim.display());
+    }
+    let meta = capture_meta(victim)?;
+    if meta.kind != "file" {
         // 目录/符号链接的快照留给 M4 的快照守护,这里不假装能做
         bail!("只能快照常规文件: {}", victim.display());
     }
-    let dest = batch.join(victim.strip_prefix("/").unwrap_or(victim));
+    let dest = batch.join(rel);
     let parent = dest.parent().context("快照目标没有父目录")?;
     ensure_secure_dir_under(home, parent)
         .with_context(|| format!("创建隔离目录 {} 失败", parent.display()))?;
     ensure_under_quarantine(home, &dest)?;
-    copy_no_clobber(victim, &dest).with_context(|| format!("快照 {} 失败", victim.display()))
+    let landed =
+        copy_no_clobber(victim, &dest).with_context(|| format!("快照 {} 失败", victim.display()))?;
+    if let Err(e) = finalize_entry(&batch, &landed, victim, &meta) {
+        // 原件还在(快照不动原件),删掉半成品副本、拒绝放行
+        let _ = std::fs::remove_file(&landed);
+        bail!("隔离清单写入失败,拒绝放行:{e:#}");
+    }
+    Ok(landed)
 }
 
 /// 从隔离区恢复。目标已存在时拒绝覆盖——恢复不能造成第二次数据丢失。
@@ -565,7 +856,12 @@ pub fn snapshot(home: &Path, victim: &Path, stamp: &str) -> Result<PathBuf> {
 /// 中间那一瞬足够别人把目标创建出来,而 `rename(2)` 覆盖目标毫不留情。
 pub fn restore(home: &Path, stamp: &str, original: &Path) -> Result<()> {
     ensure_no_traversal(original)?;
-    let src = batch_dir(home, stamp)?.join(original.strip_prefix("/").unwrap_or(original));
+    let batch = batch_dir(home, stamp)?;
+    let rel = original.strip_prefix("/").unwrap_or(original);
+    if rel.as_os_str() == MANIFEST_NAME {
+        bail!("{MANIFEST_NAME} 是批次的元数据清单,不是可恢复条目");
+    }
+    let src = batch.join(rel);
     if std::fs::symlink_metadata(&src).is_err() {
         bail!("隔离区里没有 {}(批次 {stamp})", original.display());
     }
@@ -591,6 +887,65 @@ pub fn restore(home: &Path, stamp: &str, original: &Path) -> Result<()> {
             format!("恢复目标的父目录 {} 不可信,拒绝恢复", parent.display())
         })?;
     }
+    // 回填准备:rename 之前查清单、拿住源条目的 inode。
+    // fd 打开自刚校验过的隔离区路径(全程 root 属主目录,被监督方换不掉),
+    // rename 之后回填经这个 fd 作用于 inode,与目标路径无关。
+    let rec = manifest_lookup(&batch, &rel.to_string_lossy());
+    let replay_fd = match rec.as_ref().map(|r| r.kind.as_str()) {
+        Some("file") | Some("dir") => Some(open_opath_nofollow(&src).with_context(|| {
+            format!("打开隔离条目 {} 失败,无法保真恢复", src.display())
+        })?),
+        _ => None,
+    };
+    // 目录条目要在改名**之前**解封:rename(2) 移动目录需要目录自身的写
+    // 权限(要更新 `..` 项),封存态(0550)会把恢复挡住——root daemon
+    // 因 DAC override 不受影响,但方向必须做对(单测在非 root 下抓到)。
+    // 解封与失败后的回封都经同一个 fd 作用于 inode,与路径无关。
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let mut dir_unsealed = false;
+    if let (Some(r), Some(fd)) = (
+        rec.as_ref().filter(|r| r.kind == "dir"),
+        replay_fd.as_ref(),
+    ) {
+        let owner = if is_root { Some((r.uid, r.gid)) } else { None };
+        apply_via_fd(fd, owner, Some(r.mode))
+            .with_context(|| format!("解封目录条目 {} 失败", src.display()))?;
+        dir_unsealed = true;
+    }
+    // 改名没成时把目录条目封回去(尽力而为):隔离区里不留未封存的条目。
+    let reseal_dir = || {
+        if !dir_unsealed {
+            return;
+        }
+        if let (Some(r), Some(fd)) = (&rec, replay_fd.as_ref()) {
+            let group = primary_gid_of(r.uid);
+            let owner = if is_root { Some((0, group.unwrap_or(0))) } else { None };
+            if apply_via_fd(fd, owner, Some(sealed_bits("dir", r.mode, group.is_some()))).is_err() {
+                eprintln!(
+                    "[infinisecd] 警告:恢复失败后回封目录条目 {} 失败,该条目暂为未封存态",
+                    src.display()
+                );
+            }
+        }
+    };
+    // 恢复出去的东西必须先解除封存再交还:回填失败不是小事,但文件已在
+    // 原位——如实报告"数据已恢复、元数据没回填",绝不假装整体失败。
+    let finish = |dest: &Path| -> Result<()> {
+        match &rec {
+            // 目录已在改名前解封,这里不再动
+            Some(r) if r.kind == "dir" => Ok(()),
+            Some(r) => replay_meta(r, replay_fd.as_ref(), dest).map_err(|e| {
+                anyhow!(
+                    "文件已恢复到 {},但回填原始属主/权限失败:{e:#}。\
+                     当前仍是封存态(root 只读),可手动按清单 {} 修正",
+                    dest.display(),
+                    batch.join(MANIFEST_NAME).display()
+                )
+            }),
+            // 遗留批次(没有清单):照旧恢复,不动元数据
+            None => Ok(()),
+        }
+    };
     let exists_err = || {
         anyhow::anyhow!(
             "{} 已存在,拒绝覆盖恢复——请先手动处理现有文件",
@@ -598,20 +953,33 @@ pub fn restore(home: &Path, stamp: &str, original: &Path) -> Result<()> {
         )
     };
     match rename_noreplace(&src, original) {
-        Rename2::Done => Ok(()),
-        Rename2::Exists => Err(exists_err()),
+        Rename2::Done => finish(original),
+        Rename2::Exists => {
+            reseal_dir();
+            Err(exists_err())
+        }
         Rename2::Unsupported => {
             degraded_warning("从隔离区恢复");
             if std::fs::symlink_metadata(original).is_ok() {
+                reseal_dir();
                 return Err(exists_err());
             }
-            std::fs::rename(&src, original).with_context(|| {
+            match std::fs::rename(&src, original) {
+                Ok(()) => finish(original),
+                Err(e) => {
+                    reseal_dir();
+                    Err(anyhow!(e)).with_context(|| {
+                        format!("从 {} 恢复到 {} 失败", src.display(), original.display())
+                    })
+                }
+            }
+        }
+        Rename2::Failed(e) => {
+            reseal_dir();
+            Err(anyhow::anyhow!(e)).with_context(|| {
                 format!("从 {} 恢复到 {} 失败", src.display(), original.display())
             })
         }
-        Rename2::Failed(e) => Err(anyhow::anyhow!(e)).with_context(|| {
-            format!("从 {} 恢复到 {} 失败", src.display(), original.display())
-        }),
     }
 }
 
@@ -641,6 +1009,10 @@ fn collect(base: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for e in entries {
         let e = e.with_context(|| format!("读取 {} 的目录项失败", dir.display()))?;
         let p = e.path();
+        // 批次顶层的元数据清单是账本,不是被隔离的条目
+        if dir == base && e.file_name() == std::ffi::OsStr::new(MANIFEST_NAME) {
+            continue;
+        }
         let meta = std::fs::symlink_metadata(&p)
             .with_context(|| format!("读取 {} 元数据失败", p.display()))?;
         if meta.is_dir() {
@@ -1109,6 +1481,224 @@ mod tests {
         restore(&home, GOOD, &link).unwrap();
         let meta = std::fs::symlink_metadata(&link).unwrap();
         assert!(meta.file_type().is_symlink(), "恢复出来的还得是符号链接");
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+#[cfg(test)]
+mod seal_and_fidelity_tests {
+    //! 封存与保真回填(文件头部注释里的三步设计)。
+    //!
+    //! 全部 fixture 现造于临时目录(纪律 3),样本一律无害内容。
+    //! 单测跑在非 root 下,chown 部分被跳过——mode 断言仍然有牙;
+    //! 属主部分的验收在 VM 上以真实 root daemon 复核。
+
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn tmp_home(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("infsec-seal-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    const GOOD: &str = "20260807T000000.000Z-1";
+
+    fn mode_of(p: &Path) -> u32 {
+        std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    fn set_mode(p: &Path, m: u32) {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+    }
+
+    /// 核心不变式:副本封存后写不动;restore 精确回填原始 mode。
+    #[test]
+    fn sealed_copy_loses_write_and_restore_replays_mode() {
+        let home = tmp_home("core");
+        let victim = home.join("work/f.txt");
+        std::fs::create_dir_all(victim.parent().unwrap()).unwrap();
+        std::fs::write(&victim, b"important-bytes").unwrap();
+        set_mode(&victim, 0o644);
+
+        let landed = match preserve(&home, &victim, GOOD).unwrap() {
+            Preserved::Moved(p) => p,
+            other => panic!("同文件系统应走原子移动: {other:?}"),
+        };
+        // 封存规则:去全部写位,原属主的读位迁移到主组 → 0440
+        assert_eq!(mode_of(&landed), 0o440, "副本必须被封存为只读");
+        assert!(
+            std::fs::OpenOptions::new().write(true).open(&landed).is_err(),
+            "封存后的副本必须写不动(属主写位为 0)"
+        );
+        // 但原属主(测试进程)仍读得到自己的数据——手工翻隔离区这条路不能断
+        assert_eq!(std::fs::read(&landed).unwrap(), b"important-bytes");
+
+        restore(&home, GOOD, &victim).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"important-bytes");
+        assert_eq!(mode_of(&victim), 0o644, "restore 必须回填原始 mode,不能留下封存态");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 保真度必须精确到位:0600 秘密、0755 可执行、0400 只读,各自还原。
+    #[test]
+    fn restore_replays_exact_modes() {
+        let home = tmp_home("modes");
+        for (i, orig) in [0o600u32, 0o755, 0o400].into_iter().enumerate() {
+            let victim = home.join(format!("m{orig:o}.bin"));
+            std::fs::write(&victim, b"x").unwrap();
+            set_mode(&victim, orig);
+            let stamp = format!("20260807T000000.000Z-{}", 10 + i);
+            preserve(&home, &victim, &stamp).unwrap();
+            restore(&home, &stamp, &victim).unwrap();
+            assert_eq!(
+                mode_of(&victim),
+                orig,
+                "mode {orig:o} 必须被精确回填(上一版封存正是因为丢 mode 被撤回)"
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 遗留批次(没有清单)必须照旧恢复、不动元数据——向后兼容。
+    #[test]
+    fn legacy_batch_without_manifest_still_restores() {
+        let home = tmp_home("legacy");
+        let stamp = "20260807T000000.000Z-2";
+        // 手工构造旧版批次布局:有条目、无清单
+        let victim = home.join("old/f.txt");
+        let src = quarantine_root(&home)
+            .join(stamp)
+            .join(victim.strip_prefix("/").unwrap_or(&victim));
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, b"legacy-bytes").unwrap();
+        set_mode(&src, 0o640);
+
+        std::fs::create_dir_all(victim.parent().unwrap()).unwrap();
+        restore(&home, stamp, &victim).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"legacy-bytes");
+        assert_eq!(mode_of(&victim), 0o640, "没有清单就不动元数据,原样交还");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 清单是账本,不是条目:不出现在 list_batch,不可被恢复,
+    /// 也不可被一个恰好同名的受害者路径覆盖。
+    #[test]
+    fn manifest_is_bookkeeping_not_an_entry() {
+        let home = tmp_home("book");
+        let victim = home.join("f.txt");
+        std::fs::write(&victim, b"x").unwrap();
+        preserve(&home, &victim, GOOD).unwrap();
+
+        let batch = quarantine_root(&home).join(GOOD);
+        assert!(batch.join(MANIFEST_NAME).is_file(), "清单必须真的存在");
+        let items = list_batch(&home, GOOD).unwrap();
+        assert_eq!(items.len(), 1, "清单不得出现在批次列表里: {items:?}");
+
+        assert!(
+            restore(&home, GOOD, &Path::new("/").join(MANIFEST_NAME)).is_err(),
+            "清单不是可恢复条目"
+        );
+        assert!(
+            preserve(&home, &Path::new("/").join(MANIFEST_NAME), GOOD).is_err(),
+            "与清单同名的受害者路径必须被拒(防覆盖账本)"
+        );
+        assert!(batch.join(MANIFEST_NAME).is_file(), "上述拒绝不得动到清单本身");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 空目录条目(rmdir 语义)同样封存与回填:0700 的私密目录,
+    /// 封存 0550(组保读+执行),恢复回 0700。
+    #[test]
+    fn empty_dir_entry_seals_and_replays() {
+        let home = tmp_home("dir");
+        let victim = home.join("secrets");
+        std::fs::create_dir_all(&victim).unwrap();
+        set_mode(&victim, 0o700);
+
+        let landed = match preserve(&home, &victim, GOOD).unwrap() {
+            Preserved::Moved(p) => p,
+            other => panic!("同文件系统应走原子移动: {other:?}"),
+        };
+        assert_eq!(mode_of(&landed), 0o550, "目录封存:去写,读+执行迁移到主组");
+
+        restore(&home, GOOD, &victim).unwrap();
+        assert_eq!(mode_of(&victim), 0o700, "目录 mode 必须被精确回填");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 跨文件系统的复制回退同样走封存;restore 后 mode 精确回填。
+    #[test]
+    fn cross_device_copy_is_sealed_too() {
+        if std::fs::symlink_metadata("/dev/shm")
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(true)
+        {
+            eprintln!("跳过:/dev/shm 不存在或是符号链接");
+            return;
+        }
+        let home = PathBuf::from("/dev/shm").join(format!("infsec-sealx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        if std::fs::create_dir_all(&home).is_err() {
+            eprintln!("跳过:没有 /dev/shm");
+            return;
+        }
+        let victim_dir = std::env::temp_dir().join(format!("infsec-sealx-v-{}", std::process::id()));
+        std::fs::create_dir_all(&victim_dir).unwrap();
+        let victim = victim_dir.join("f.txt");
+        std::fs::write(&victim, b"xdev-bytes").unwrap();
+        set_mode(&victim, 0o664);
+
+        match preserve(&home, &victim, GOOD) {
+            Ok(Preserved::Copied(dest)) => {
+                assert_eq!(mode_of(&dest), 0o440, "复制回退的副本同样必须封存");
+                assert_eq!(std::fs::read(&dest).unwrap(), b"xdev-bytes");
+                assert!(victim.exists(), "复制回退不动原件");
+            }
+            Ok(Preserved::Moved(_)) => eprintln!("跳过:两处其实同一个文件系统"),
+            Err(e) => panic!("跨设备保全应回退为复制: {e}"),
+        }
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&victim_dir).ok();
+    }
+
+    /// truncate 前的快照副本也封存;快照不动原件。
+    #[test]
+    fn snapshot_copy_is_sealed() {
+        let home = tmp_home("snap");
+        let victim = home.join("data.db");
+        std::fs::write(&victim, b"db-bytes").unwrap();
+        set_mode(&victim, 0o644);
+
+        let landed = snapshot(&home, &victim, GOOD).unwrap();
+        assert_eq!(mode_of(&landed), 0o440, "快照副本必须封存");
+        assert_eq!(mode_of(&victim), 0o644, "快照不得动原件的权限");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"db-bytes");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 符号链接条目:不 chmod(chmod 跟随链接,会打到目标——踩过的坑),
+    /// 恢复出来仍是符号链接。既有 seal_never_touches_symlink_target
+    /// 断言零影响,这里断言清单记账正确。
+    #[test]
+    fn symlink_entry_recorded_and_roundtrips() {
+        let home = tmp_home("sym");
+        let link = home.join("link");
+        std::os::unix::fs::symlink("/etc/hostname", &link).unwrap();
+        preserve(&home, &link, GOOD).unwrap();
+
+        let batch = quarantine_root(&home).join(GOOD);
+        let data = std::fs::read_to_string(batch.join(MANIFEST_NAME)).unwrap();
+        assert!(
+            data.contains("\"kind\":\"symlink\""),
+            "清单必须如实记录条目类型: {data}"
+        );
+        restore(&home, GOOD, &link).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "恢复出来的还得是符号链接"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }

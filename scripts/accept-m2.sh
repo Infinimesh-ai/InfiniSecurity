@@ -200,6 +200,61 @@ else
     chk SKIP "无新增批次:restore 未验"
 fi
 
+# ---------- ①a 隔离副本封存与保真回填 ----------
+# 2026-08-07 补上的缺口:此前隔离副本仍是被监督用户属主、保留原 mode,
+# 可被事后清零(而 quarantine list 照样列出它,比直接删掉更迷惑人)。
+# 现在:落盘后副本 chown root + 去写位(原属主经主组保读),批次内旁挂
+# .infsec-meta.jsonl 记录原始 uid/gid/mode,restore 时精确回填——
+# 上一版直接封存正是因为丢保真度(恢复回来 root:root 0440)被撤回,
+# 所以这里对"封存"与"保真"两头都要有牙。
+note "①a 隔离副本封存(root 只读)与 restore 保真回填"
+cd "$FIX/withremote" || exit 1
+echo seal-fixture > sealme.txt
+chmod 600 sealme.txt
+git add sealme.txt >/dev/null 2>&1 && git commit -qm seal >/dev/null 2>&1 \
+    && git push -q origin HEAD 2>/dev/null
+QBASE2=$(q_stamps)
+infsec run --profile interactive -- unlink sealme.txt >/dev/null 2>&1
+SEALSTAMP=$(q_new "$QBASE2" | tail -1)
+if [[ -n "$SEALSTAMP" && ! -e sealme.txt ]]; then
+    LANDED="$HOME/.infinisec/quarantine/$SEALSTAMP$FIX/withremote/sealme.txt"
+    SOWNER=$(stat -c '%U' "$LANDED" 2>/dev/null)
+    SMODE=$(stat -c '%a' "$LANDED" 2>/dev/null)
+    [[ "$SOWNER" == root ]] && chk PASS "隔离副本属主是 root" \
+        || chk FAIL "隔离副本属主是 ${SOWNER:-读不到}(期望 root,路径 $LANDED)"
+    # 原件 0600:属主读位迁移到主组 → 440;查不到主组的布局是 400
+    [[ "$SMODE" == 440 || "$SMODE" == 400 ]] \
+        && chk PASS "隔离副本已封存(mode=$SMODE,无任何写位)" \
+        || chk FAIL "隔离副本 mode=${SMODE:-读不到}(期望 440/400)"
+    # 缺口存在的全部意义:原属主必须写不动副本
+    if (echo tamper >> "$LANDED") 2>/dev/null; then
+        chk FAIL "被监督用户仍能改写隔离副本(封存无效)"
+    else
+        chk PASS "被监督用户写不动隔离副本"
+    fi
+    asroot test -f "$HOME/.infinisec/quarantine/$SEALSTAMP/.infsec-meta.jsonl" \
+        && chk PASS "批次内存在旁挂元数据清单" \
+        || chk FAIL "批次内没有 .infsec-meta.jsonl"
+    # 清单是账本不是条目:不得出现在批次列表里
+    infsec quarantine list "$SEALSTAMP" 2>/dev/null | grep -q 'infsec-meta' \
+        && chk FAIL "元数据清单被当成条目列出" \
+        || chk PASS "元数据清单不出现在批次条目里"
+    infsec quarantine restore "$SEALSTAMP" "$FIX/withremote/sealme.txt" >/dev/null 2>&1
+    RMODE=$(stat -c '%a' sealme.txt 2>/dev/null)
+    ROWNER=$(stat -c '%U' sealme.txt 2>/dev/null)
+    ME=$(id -un)
+    if [[ "$(cat sealme.txt 2>/dev/null)" == "seal-fixture" \
+          && "$RMODE" == 600 && "$ROWNER" == "$ME" ]]; then
+        chk PASS "restore 保真回填(内容一致、mode=600、属主=$ME)"
+    else
+        chk FAIL "restore 保真回填失败(内容/mode=${RMODE:-?}/属主=${ROWNER:-?},期望 seal-fixture/600/$ME)"
+    fi
+else
+    for i in 副本属主 封存mode 写不动 清单存在 清单不列出 保真回填; do
+        chk SKIP "封存断言「$i」:T1 删除未产生新批次,未测"
+    done
+fi
+
 # ---------- ② 路径语义分级 ----------
 note "② 路径语义分级 S0/S2/S3"
 infsec run --profile interactive -- unlink node_modules/pkg/i.js >/dev/null 2>&1
